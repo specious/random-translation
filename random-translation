@@ -1,0 +1,693 @@
+#!/usr/bin/env bash
+
+# Production-quality tool to pick a random installed .mo file for one or more languages
+# and output translations.
+#
+# Should work on macOS, Linux, and all *nix OS'es. Caching is disabled by default.
+#
+# Features
+#  - discovery strategies: quick, indexed, targeted, deep, cached
+#  - cache behavior control: read, write, none (none is default)
+#  - caching with TTL and refresh (only when cache-mode is read/write)
+#  - flexible output: normal|json|yaml|filename
+#  - return N random msgstr strings (-n N)
+#  - robust locale matching (es, es_ES, es-ES, es_ES.UTF-8)
+#  - discovery roots override (--roots)
+#  - debug shows what each strategy and cache decision is doing
+#  - version via --version
+#
+# Exit codes
+#  0 success
+#  1 usage / argument error
+#  2 missing tools for extraction
+#  3 no matches found
+#  4 selection failure
+
+set -euo pipefail
+
+# Avoid Python BrokenPipe tracebacks when consumer (yq/jq) closes early
+trap '' PIPE
+
+VERSION="0.0.0"
+
+usage() {
+  cat <<'EOF'
+Usage: [options] LANGS...
+
+  LANGS may be one or more language codes (space or comma separated).
+
+  Examples:
+    - Single codes: es tr el
+    - Comma list: "es,el,tr"
+    - Locale variant: es_ES
+
+Options
+  --roots PATHS       Colon-separated roots to search (overrides default roots)
+  --strategy STR      Discovery strategy: quick|indexed|targeted|deep|cached
+  --cache-mode MODE   Cache behavior: read|write|none
+  --refresh           Force rebuild of the .mo list (applies when cache-mode is write or when using transient cache)
+  --ttl SECS          Cache TTL in seconds (default 3600)
+  --debug             Print debug information showing what each strategy and cache decision does
+  -n N                Print N random msgstr strings only (useful for screensavers)
+  --output MODE       Output mode: normal|json|yaml|filename  (default: normal)
+  --cache-stats       Print cache age and entry count then exit
+  --version           Print version and exit
+  --dry-run           Print the path that would be read and exit (alias for --output filename)
+  -h, --help          Show this help
+EOF
+  exit 1
+}
+
+# Defaults
+DEFAULT_LOCALE_DIRS="/usr/share/locale:/usr/local/share/locale:/usr/share/locale-langpack:/usr/lib/locale:/Library/Locale:/System/Library/Frameworks/Python.framework/Versions/Current/Resources/locale"
+STRATEGY="quick"
+LOCALE_DIRS="${LOCALE_DIRS:-$DEFAULT_LOCALE_DIRS}"
+CACHE_MODE="none" # read | write | none
+CACHE_MODE_SET=0 # becomes 1 if user explicitly passed --cache-mode
+REFRESH=0
+DEBUG=0
+N_STRINGS=0
+OUTPUT_MODE="normal" # normal | json | yaml | filename
+CACHE_STATS=0
+TTL=3600
+ROOTS=""
+LANGS=""
+
+# Print missing-argument error and show usage
+_missing_arg() { echo "error: missing value for $1" >&2; usage; }
+
+# Return the next argv value or call _missing_arg
+_getval() {
+  flag="$1"; val="${2-}"
+  [ -n "${val-}" ] || _missing_arg "$flag"
+  # reject values that look like flags (optional stricter behavior)
+  case "$val" in -*) _missing_arg "$flag" ;; esac
+  printf '%s' "$val"
+}
+
+# Parse args (compact, safe under set -u)
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --roots)      ROOTS="$(_getval --roots "${2-}")"; shift 2 ;;
+    --strategy)   STRATEGY="$(_getval --strategy "${2-}")"; shift 2 ;;
+    --cache-mode) CACHE_MODE="$(_getval --cache-mode "${2-}")"; CACHE_MODE_SET=1; shift 2 ;;
+    --refresh)    REFRESH=1; shift ;;
+    --ttl)        TTL="$(_getval --ttl "${2-}")"; shift 2 ;;
+    --debug)      DEBUG=1; shift ;;
+    -n)           N_STRINGS="$(_getval -n "${2-}")"; shift 2 ;;
+    --output)     OUTPUT_MODE="$(_getval --output "${2-}")"; shift 2 ;;
+    --cache-stats) CACHE_STATS=1; shift ;;
+    --version)    printf '%s\n' "$VERSION"; exit 0 ;;
+    --dry-run)    OUTPUT_MODE="filename"; shift ;;
+    -h|--help)    usage ;;
+    --) shift; break ;;
+    -*)
+      echo "Unknown option: $1" >&2; usage
+      ;;
+    *)
+      LANGS="${LANGS} ${1}"; shift
+      ;;
+  esac
+done
+
+# Merge env var LANG_CODES if present
+if [ -n "${LANG_CODES:-}" ]; then
+  LANGS="${LANGS} ${LANG_CODES}"
+fi
+
+# Cache setup
+XDG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}"
+CACHE_DIR="${CACHE_DIR:-$XDG_CACHE/random-translation}"
+CACHE_FILE="${CACHE_FILE:-$CACHE_DIR/mos.cache}"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+# If user asked for cache stats, print them and exit even if LANGS is empty
+if [ "${CACHE_STATS:-0}" -eq 1 ]; then
+  if [ -f "$CACHE_FILE" ]; then
+    if stat -f %m "$CACHE_FILE" >/dev/null 2>&1; then
+      mtime=$(stat -f %m "$CACHE_FILE")
+    else
+      mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+    fi
+    now=$(date +%s)
+    age=$((now - mtime))
+    count=$(wc -l <"$CACHE_FILE" 2>/dev/null || echo 0)
+    printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "$CACHE_FILE" "$count" "$age"
+    exit 0
+  else
+    echo "Cache file not found: $CACHE_FILE" >&2
+    exit 0
+  fi
+fi
+
+# Helpful behavior: if user asked for --strategy cached but provided no LANGS,
+# show a short diagnostic about the cache (instead of falling through to usage).
+if [ "${STRATEGY:-}" = "cached" ] && [ -z "${LANGS:-}" ]; then
+  if [ -f "$CACHE_FILE" ]; then
+    if stat -f %m "$CACHE_FILE" >/dev/null 2>&1; then
+      mtime=$(stat -f %m "$CACHE_FILE")
+    else
+      mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+    fi
+    now=$(date +%s)
+    age=$((now - mtime))
+    count=$(wc -l <"$CACHE_FILE" 2>/dev/null || echo 0)
+    echo "Note: --strategy cached implies --cache-mode read; showing cache status." >&2
+    printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "$CACHE_FILE" "$count" "$age"
+    echo >&2
+    echo "To sample translations, provide one or more LANGS, e.g.:" >&2
+    echo "  random-translation -n 1 el tr es" >&2
+    exit 0
+  else
+    echo "error: strategy 'cached' requires an existing cache file: $CACHE_FILE" >&2
+    echo "Hint: build the cache with --strategy indexed --cache-mode write --refresh LANG" >&2
+    exit 3
+  fi
+fi
+
+# Normalize languages: convert commas to spaces, trim
+LANGS=$(printf '%s\n' "$LANGS" | awk 'BEGIN{ORS=" "} {gsub(/,/," "); for(i=1;i<=NF;i++) print $i}' | sed 's/^ *//; s/ *$//')
+if [ -z "$LANGS" ]; then
+  echo "error: no language specified. Provide one or more language codes as arguments." >&2
+  usage
+fi
+
+# Validate targeted strategy usage: require --roots when using targeted
+if [ "${STRATEGY:-}" = "targeted" ] && [ -z "${ROOTS:-}" ]; then
+  echo "error: --strategy targeted requires --roots to be set (colon-separated list of directories)." >&2
+  echo >&2
+  echo "Usage example:" >&2
+  echo "  ./random-translation --strategy targeted --roots '/usr/share/locale:/usr/local/share/locale' el" >&2
+  exit 1
+fi
+
+# If strategy is cached and user didn't explicitly set cache-mode, imply read-only cache
+if [ "${STRATEGY:-}" = "cached" ] && [ "${CACHE_MODE_SET:-0}" -eq 0 ]; then
+  # Note: --strategy cached implies --cache-mode read; proceeding in read-only cache mode
+  CACHE_MODE="read"
+fi
+
+# Validate CACHE_MODE and OUTPUT_MODE
+case "$CACHE_MODE" in
+  read|write|none) ;;
+  *)
+    echo "error: invalid --cache-mode value: $CACHE_MODE" >&2
+    usage
+    ;;
+esac
+
+case "$OUTPUT_MODE" in
+  normal|json|yaml|filename) ;;
+  *)
+    echo "error: invalid --output value: $OUTPUT_MODE" >&2
+    usage
+    ;;
+esac
+
+append_dir() {
+  local new="$1"
+  case ":$LOCALE_DIRS:" in *":$new:"*) ;; *) LOCALE_DIRS="${LOCALE_DIRS}:$new" ;; esac
+}
+
+# If user provided --roots, add them to LOCALE_DIRS
+if [ -n "$ROOTS" ]; then
+  IFS=':' read -r -a _roots <<< "$ROOTS"
+  for r in "${_roots[@]}"; do
+    [ -n "$r" ] && append_dir "$r"
+  done
+fi
+
+# Discovery dispatcher with debug messages
+discover_mo_list() {
+  local strategy="$1"; local cache="$2"; local debug="$3"; local roots="$4"
+  : >"$cache"
+
+  case "$strategy" in
+    quick)
+      [ "$debug" -eq 1 ] && echo "DEBUG: quick strategy scanning common roots" >&2
+      for d in /usr/share/locale /usr/local/share/locale /opt/homebrew/share/locale $roots; do
+        [ -z "$d" ] && continue
+        [ -d "$d" ] || continue
+        [ "$debug" -eq 1 ] && echo "DEBUG: find under $d (shallow)" >&2
+        find "$d" -type f -path '*/LC_MESSAGES/*.mo' -maxdepth 6 2>/dev/null >>"$cache" || true
+      done
+      ;;
+
+    indexed)
+      [ "$debug" -eq 1 ] && echo "DEBUG: indexed strategy using mdfind/locate if available" >&2
+      if command -v mdfind >/dev/null 2>&1; then
+        [ "$debug" -eq 1 ] && echo "DEBUG: using mdfind" >&2
+        mdfind "kMDItemFSName == '*.mo'c" 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
+      elif command -v locate >/dev/null 2>&1; then
+        [ "$debug" -eq 1 ] && echo "DEBUG: using locate" >&2
+        locate --existing '*.mo' 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
+      else
+        [ "$debug" -eq 1 ] && echo "DEBUG: no indexer found; falling back to limited find" >&2
+        for d in /usr/share /usr/local /opt /Applications; do
+          [ -d "$d" ] || continue
+          find "$d" -type f -iname '*.mo' -maxdepth 6 2>/dev/null >>"$cache" || true
+        done
+      fi
+      ;;
+
+    targeted)
+      [ "$debug" -eq 1 ] && echo "DEBUG: targeted strategy scanning roots: $roots" >&2
+      IFS=':' read -r -a _roots <<< "$roots"
+      for d in "${_roots[@]}"; do
+        [ -z "$d" ] && continue
+        [ -d "$d" ] || continue
+        [ "$debug" -eq 1 ] && echo "DEBUG: find under $d (targeted)" >&2
+        find "$d" -type f -path '*/LC_MESSAGES/*.mo' -maxdepth 6 2>/dev/null >>"$cache" || true
+      done
+      ;;
+
+    deep)
+      [ "$debug" -eq 1 ] && echo "DEBUG: deep strategy full scan (may be slow)" >&2
+      find / -type f -iname '*.mo' -maxdepth 8 -path '/System' -prune -o -path '/private/var' -prune -o -path '/Volumes' -prune -o -print 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
+      ;;
+
+    cached)
+      [ "$debug" -eq 1 ] && echo "DEBUG: cached strategy: using existing cache only" >&2
+      # do nothing
+      ;;
+
+    *)
+      echo "error: unknown strategy: $strategy" >&2
+      return 1
+      ;;
+  esac
+
+  if [ -s "$cache" ]; then
+    awk '!seen[$0]++' "$cache" >"${cache}.uniq" || true
+    mv "${cache}.uniq" "$cache"
+  fi
+  return 0
+}
+
+# Compact, correct cache-mode logic
+rebuild_cache=0
+SKIP_LOCALE_FILTER=0   # when cache-mode=none we will skip LOCALE_DIRS filtering
+
+case "$CACHE_MODE" in
+  none)
+    # Completely ignore cache: no read, no write, no TTL, no fallback
+    [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache-mode=none → ignoring cache entirely" >&2
+    rebuild_cache=1
+    SKIP_LOCALE_FILTER=1
+    ;;
+
+  read)
+    # Read-only: rebuild only if --refresh
+    if [ "$REFRESH" -eq 1 ]; then
+      rebuild_cache=1
+    else
+      if [ ! -f "$CACHE_FILE" ]; then
+        echo "error: cache-mode=read but no cache file exists: $CACHE_FILE" >&2
+        exit 3
+      fi
+      [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache-mode=read → using existing cache" >&2
+    fi
+    ;;
+
+  write)
+    # Write mode: rebuild if refresh, missing, or TTL expired
+    if [ "$REFRESH" -eq 1 ] || [ ! -f "$CACHE_FILE" ]; then
+      rebuild_cache=1
+    else
+      now=$(date +%s)
+      if stat -f %m "$CACHE_FILE" >/dev/null 2>&1; then
+        mtime=$(stat -f %m "$CACHE_FILE")
+      else
+        mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+      fi
+      age=$((now - mtime))
+      [ "$age" -ge "$TTL" ] && rebuild_cache=1
+
+      [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache-mode=write → age=$age TTL=$TTL rebuild=$rebuild_cache" >&2
+    fi
+    ;;
+esac
+
+# Build or load cache according to rebuild decision
+if [ "$rebuild_cache" -eq 1 ]; then
+  TMP_CACHE="$(mktemp -t mos.cache.XXXXXX 2>/dev/null || mktemp)"
+  trap 'rm -f "$TMP_CACHE"' EXIT
+
+  discover_mo_list "$STRATEGY" "$TMP_CACHE" "$DEBUG" "$ROOTS"
+
+  if [ "$CACHE_MODE" = "write" ]; then
+    mv "$TMP_CACHE" "$CACHE_FILE"
+    [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache written with $(wc -l <"$CACHE_FILE" | tr -d ' ') entries" >&2
+  else
+    # transient list for this run
+    CACHE_FILE="$TMP_CACHE"
+    [ "$DEBUG" -eq 1 ] && echo "DEBUG: transient list built with $(wc -l <"$CACHE_FILE" | tr -d ' ') entries (not persisted)" >&2
+  fi
+
+else
+  # Only reached for cache-mode read/write when rebuild not required
+  [ "$DEBUG" -eq 1 ] && echo "DEBUG: using existing cache file: $CACHE_FILE (mode=$CACHE_MODE)" >&2
+fi
+
+# Ensure cache file exists and has entries
+if [ ! -s "$CACHE_FILE" ]; then
+  # Only call it "cache empty" when we actually consulted a persistent cache (cache-mode read/write and not transient).
+  # If the quick discovery strategy was used (the default) it may not find .mo files on some systems
+  # (macOS and some package layouts place locale data in locations not covered by the shallow quick scan).
+  # Provide a helpful explanation and a short tutorial on how to build a persistent cache.
+  if [ "$CACHE_MODE" = "read" ] || [ "$CACHE_MODE" = "write" ]; then
+    echo >&2
+    echo "No .mo files found (cache empty)." >&2
+    echo >&2
+    echo "Hint: you asked to use the cache; the cache exists but contains no entries." >&2
+    echo >&2
+    echo "To build a cache of installed .mo files, run:" >&2
+    echo "  ./random-translation --strategy indexed --cache-mode write --refresh LANG" >&2
+    echo "or, for a full scan (slower):" >&2
+    echo "  ./random-translation --strategy deep --cache-mode write --refresh LANG" >&2
+    echo >&2
+    echo "Why: the default 'quick' strategy scans a small set of common locations and may miss" >&2
+    echo "system- or package-specific locale directories. Using 'indexed' (mdfind/locate) or" >&2
+    echo "'deep' (full scan) and writing the results to the cache ensures subsequent runs are fast." >&2
+  else
+    # cache-mode none (transient discovery) — explain quick strategy limitation and suggest building a cache
+    echo >&2
+    echo "No .mo files found." >&2
+    echo >&2
+    echo "Note: the default 'quick' discovery strategy performs a shallow scan and may not find" >&2
+    echo "installed .mo files on some systems. To build a persistent cache that covers more locations," >&2
+    echo "run one of the following (replace LANG with your language codes):" >&2
+    echo "  ./random-translation --strategy indexed --cache-mode write --refresh LANG" >&2
+    echo "  ./random-translation --strategy deep --cache-mode write --refresh LANG" >&2
+    echo >&2
+    echo "After building the cache you can run without --refresh for faster selection." >&2
+  fi
+  exit 3
+fi
+
+# Prepare matching: normalize languages to underscore form
+NORMALS=""
+for l in $LANGS; do
+  nl=$(printf '%s' "$l" | sed 's/-/_/g')
+  NORMALS="${NORMALS} ${nl}"
+done
+NORMALS=$(printf '%s\n' "$NORMALS" | sed 's/^ *//; s/ *$//')
+
+# Filter cache by LOCALE_DIRS and languages
+TMP_MATCH="$(mktemp -t mos.match.XXXXXX 2>/dev/null || mktemp)"
+trap 'rm -f "$TMP_MATCH"' EXIT
+
+while IFS= read -r f; do
+  # If cache-mode=none we skip LOCALE_DIRS filtering because discovery may have returned paths outside LOCALE_DIRS
+  if [ "$SKIP_LOCALE_FILTER" -eq 0 ]; then
+    ok=0
+    IFS=':' read -r -a _roots <<< "$LOCALE_DIRS"
+    for d in "${_roots[@]}"; do
+      [ -z "$d" ] && continue
+      case "$f" in "$d"/*) ok=1; break ;; esac
+    done
+    [ "$ok" -eq 0 ] && continue
+  fi
+
+  lcdir=$(printf '%s\n' "$f" | awk -F"/LC_MESSAGES/" '{left=$1; n=split(left,a,"/"); print a[n]}')
+  [ -z "$lcdir" ] && lcdir=$(basename "$(dirname "$f")")
+  lcnorm=$(printf '%s' "$lcdir" | sed 's/-/_/g')
+  for want in $NORMALS; do
+    wantn=$(printf '%s' "$want" | sed 's/-/_/g')
+    case "$lcnorm" in
+      "$wantn" | "$wantn"_* | "$wantn".* | "$wantn"-* ) printf '%s\n' "$f" >>"$TMP_MATCH"; break ;;
+      *) case "$lcnorm" in "$wantn"*) printf '%s\n' "$f" >>"$TMP_MATCH"; break ;; esac ;;
+    esac
+  done
+done <"$CACHE_FILE"
+
+if [ ! -s "$TMP_MATCH" ]; then
+  [ "$DEBUG" -eq 1 ] && { echo "DEBUG: cache sample (first 50):" >&2; head -n 50 "$CACHE_FILE" >&2 || true; }
+  echo "No .mo files found for languages: $LANGS" >&2
+  exit 3
+fi
+
+awk '!seen[$0]++' "$TMP_MATCH" >"${TMP_MATCH}.uniq" || true
+mv "${TMP_MATCH}.uniq" "$TMP_MATCH"
+
+count=$(wc -l <"$TMP_MATCH" | tr -d ' ')
+[ "$DEBUG" -eq 1 ] && echo "DEBUG: matched $count .mo files for languages: $LANGS" >&2
+
+selected=$(awk 'BEGIN{srand()} {a[NR]=$0} END{if(NR>0) print a[int(rand()*NR)+1]}' "$TMP_MATCH" || true)
+if [ -z "$selected" ]; then
+  [ "$DEBUG" -eq 1 ] && echo "DEBUG: no selection possible" >&2
+  echo "No .mo file would be selected for languages: $LANGS" >&2
+  exit 3
+fi
+[ "$DEBUG" -eq 1 ] && printf 'DEBUG: Selected: %s\n' "$selected" >&2
+
+# If output mode is filename (or dry-run), print the filename and exit
+if [ "$OUTPUT_MODE" = "filename" ]; then
+  # Print to stdout for pipeline consumption
+  printf '%s\n' "$selected"
+  exit 0
+fi
+
+# Extraction helpers
+PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+HAS_MSGUNFMT=0
+if command -v msgunfmt >/dev/null 2>&1; then HAS_MSGUNFMT=1; fi
+
+# Helper: use Python to load .mo and return catalog as list of (msgid,msgstr)
+# Use python reading script from stdin and pass selected path as argv[1] (python - selected <<'PY')
+if [ "$OUTPUT_MODE" = "json" ] || [ "$OUTPUT_MODE" = "yaml" ] || [ "$N_STRINGS" -gt 0 ]; then
+  if [ -n "$PY" ]; then
+    if [ "$OUTPUT_MODE" = "json" ]; then
+      "$PY" - "$selected" <<'PYCODE'
+import sys, json, random
+from gettext import GNUTranslations
+p = sys.argv[1]
+try:
+    with open(p,'rb') as fh:
+        t = GNUTranslations(fh)
+except Exception as e:
+    print(json.dumps({"error":str(e)}))
+    sys.exit(1)
+cat = getattr(t,'_catalog',{}) or {}
+out=[]
+for k,v in cat.items():
+    if k == '':
+        continue
+    # Plural forms note: if k is a tuple (plural forms), pick one at random so output varies across runs.
+    if isinstance(k,tuple):
+        k = random.choice(k)
+    out.append({"msgid":k,"msgstr":v})
+print(json.dumps(out, ensure_ascii=False))
+PYCODE
+      exit 0
+    fi
+
+    if [ "$OUTPUT_MODE" = "yaml" ]; then
+      # Python YAML emitter: preserve Unicode, replace tabs with two spaces, sanitize control chars
+      "$PY" - "$selected" <<'PYCODE'
+import sys, re, random
+from gettext import GNUTranslations
+p = sys.argv[1]
+try:
+    with open(p,'rb') as fh:
+        t = GNUTranslations(fh)
+except Exception as e:
+    sys.stderr.write("error: %s\n" % e)
+    sys.exit(1)
+cat = getattr(t,'_catalog',{}) or {}
+
+def safe_lines(s):
+    if s is None:
+        return ['']
+    text = str(s)
+    # replace tabs with 2 spaces
+    text = text.replace('\t', '  ')
+    # replace control characters except newline (0x0A) and carriage return (0x0D) with '?'
+    text = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f]', '?', text)
+    # split into lines (preserve empty lines)
+    lines = text.splitlines() or ['']
+    return lines
+
+for k,v in cat.items():
+    if k == '':
+        continue
+    # Plural forms note: if k is a tuple (plural forms), pick one at random so output varies across runs.
+    if isinstance(k,tuple):
+        k = random.choice(k)
+    print("- msgid: |")
+    for line in safe_lines(k):
+        print("    " + line)
+    print("  msgstr: |")
+    for line in safe_lines(v):
+        print("    " + line)
+PYCODE
+      exit 0
+    fi
+
+    if [ "$N_STRINGS" -gt 0 ]; then
+      "$PY" - "$selected" "$N_STRINGS" <<'PYCODE'
+import sys, random
+from gettext import GNUTranslations
+p = sys.argv[1]
+n = int(sys.argv[2])
+try:
+    with open(p,'rb') as fh:
+        t = GNUTranslations(fh)
+except Exception as e:
+    sys.stderr.write("python: failed to read .mo: %s\n" % e)
+    sys.exit(1)
+cat = getattr(t,'_catalog',{}) or {}
+vals = []
+for k,v in cat.items():
+    if k == '':
+        continue
+    # Plural forms note: if k is a tuple (plural forms), pick one at random so msgstr selection can vary.
+    if isinstance(k,tuple):
+        k = random.choice(k)
+    if v:
+        vals.append(v)
+if not vals:
+    sys.exit(0)
+# unique and shuffle
+seen = set()
+uniq = []
+for s in vals:
+    if s not in seen:
+        seen.add(s)
+        uniq.append(s)
+random.shuffle(uniq)
+for s in uniq[:n]:
+    print(s)
+PYCODE
+      exit 0
+    fi
+
+  else
+    # No python: fall back to msgunfmt for -n or json/yaml best-effort
+    if [ "$HAS_MSGUNFMT" -eq 1 ]; then
+      if [ "$OUTPUT_MODE" = "json" ]; then
+        # best-effort: parse msgunfmt output into JSON
+        msgunfmt "$selected" | awk '
+          BEGIN{RS=""; ORS=""; print "["}
+          {
+            id=""; str="";
+            for(i=1;i<=NF;i++){
+              if($i ~ /^msgid /){sub(/^msgid /,"",$i); id=$i}
+              if($i ~ /^msgstr /){sub(/^msgstr /,"",$i); str=$i}
+            }
+            if(id!="" || str!=""){
+              gsub(/^"/,"",id); gsub(/"$/,"",id);
+              gsub(/^"/,"",str); gsub(/"$/,"",str);
+              if(NR>1) printf(",")
+              printf("{\"msgid\":\"%s\",\"msgstr\":\"%s\"}", id, str)
+            }
+          }
+          END{print "]"}'
+        exit 0
+      fi
+
+      if [ "$OUTPUT_MODE" = "yaml" ]; then
+        # Prefer perl if available; otherwise use tr+awk fallback.
+        if command -v perl >/dev/null 2>&1; then
+          msgunfmt "$selected" | \
+            perl -CSD -pe 's/\t/  /g; s/[\x00-\x09\x0b\x0c\x0e-\x1f]/?/g' | \
+            awk '
+              BEGIN{RS=""; ORS=""}
+              {
+                id=""; str="";
+                for(i=1;i<=NF;i++){
+                  if($i ~ /^msgid /){sub(/^msgid /,"",$i); id=$i}
+                  if($i ~ /^msgstr /){sub(/^msgstr /,"",$i); str=$i}
+                }
+                if(id!="" || str!=""){
+                  gsub(/^"/,"",id); gsub(/"$/,"",id);
+                  gsub(/^"/,"",str); gsub(/"$/,"",str);
+                  print "- msgid: |\n"
+                  n=split(id,lines,"\n")
+                  for(i=1;i<=n;i++) printf("    %s\n", lines[i])
+                  print "  msgstr: |\n"
+                  n=split(str,lines2,"\n")
+                  for(i=1;i<=n;i++) printf("    %s\n", lines2[i])
+                }
+              }'
+        else
+          # Portable fallback: tr replaces tabs with two spaces and control bytes with '?'
+          msgunfmt "$selected" | \
+            tr '\t' '  ' | \
+            tr '\001-\011\013\014\016-\037' '?' | \
+            awk '
+              BEGIN{RS=""; ORS=""}
+              {
+                id=""; str="";
+                for(i=1;i<=NF;i++){
+                  if($i ~ /^msgid /){sub(/^msgid /,"",$i); id=$i}
+                  if($i ~ /^msgstr /){sub(/^msgstr /,"",$i); str=$i}
+                }
+                if(id!="" || str!=""){
+                  gsub(/^"/,"",id); gsub(/"$/,"",id);
+                  gsub(/^"/,"",str); gsub(/"$/,"",str);
+                  print "- msgid: |\n"
+                  n=split(id,lines,"\n")
+                  for(i=1;i<=n;i++) printf("    %s\n", lines[i])
+                  print "  msgstr: |\n"
+                  n=split(str,lines2,"\n")
+                  for(i=1;i<=n;i++) printf("    %s\n", lines2[i])
+                }
+              }'
+        fi
+        exit 0
+      fi
+
+      if [ "$N_STRINGS" -gt 0 ]; then
+        msgunfmt "$selected" | awk '/^msgstr /{sub(/^msgstr /,""); gsub(/^"/,""); gsub(/"$/,""); print}' | awk '!seen[$0]++' >"${CACHE_DIR}/.tmp_strs"
+        total=$(wc -l <"${CACHE_DIR}/.tmp_strs" | tr -d ' ')
+        if [ "$total" -eq 0 ]; then exit 0; fi
+        awk -v n="$N_STRINGS" 'BEGIN{srand()} {a[NR]=$0} END{for(i=1;i<=n && i<=NR;i++){idx=int(rand()*NR)+1; print a[idx]}}' "${CACHE_DIR}/.tmp_strs"
+        rm -f "${CACHE_DIR}/.tmp_strs"
+        exit 0
+      fi
+    else
+      echo "error: JSON/YAML/-n modes require python or msgunfmt." >&2
+      exit 2
+    fi
+  fi
+fi
+
+# Default: print PO-like output (normal mode)
+if [ "$OUTPUT_MODE" = "normal" ]; then
+  if [ "$HAS_MSGUNFMT" -eq 1 ]; then
+    msgunfmt "$selected"
+    exit 0
+  else
+    if [ -n "$PY" ]; then
+      "$PY" - "$selected" <<'PYCODE'
+import sys, random
+from gettext import GNUTranslations
+p = sys.argv[1]
+try:
+    with open(p,'rb') as fh:
+        t = GNUTranslations(fh)
+except Exception as e:
+    sys.stderr.write("python: failed to read .mo: %s\n" % e)
+    sys.exit(1)
+cat = getattr(t,'_catalog',{}) or {}
+for k,v in cat.items():
+    if k == '':
+        continue
+    # Plural forms note: if k is a tuple (plural forms), pick one at random so output varies across runs.
+    if isinstance(k,tuple):
+        k = random.choice(k)
+    print('msgid: %s' % (k,))
+    print('msgstr: %s' % (v,))
+    print()
+PYCODE
+      exit 0
+    else
+      echo "error: neither msgunfmt nor python available to show translations." >&2
+      exit 2
+    fi
+  fi
+fi
+
+# Should not reach here
+exit 0
