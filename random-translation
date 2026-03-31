@@ -555,7 +555,43 @@ if [ "$OUTPUT_MODE" = "filename" ]; then
 fi
 
 # Extraction helpers
-PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+#
+# On macOS, /usr/bin/python3 is an Xcode Command Line Tools stub that invokes
+# xcrun, which is blocked inside the App Sandbox (Phosphor / XScreenSaver on
+# macOS Sequoia).  Prefer real interpreter binaries from known package manager
+# and framework paths over the stub.  Fall back to the stub only as a last
+# resort (it works fine outside a sandbox, e.g. in a terminal).
+#
+_find_real_python() {
+  local candidates=(
+    /opt/homebrew/bin/python3
+    /usr/local/bin/python3
+    /opt/local/bin/python3
+    /usr/bin/python3
+    /usr/local/bin/python
+    /usr/bin/python
+  )
+  # Also sweep Python.framework versioned binaries (macOS system or user installs)
+  for fw in \
+      /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+      /System/Library/Frameworks/Python.framework/Versions/Current/bin/python3; do
+    [ -x "$fw" ] && candidates+=("$fw")
+  done
+  local py
+  for py in "${candidates[@]}"; do
+    [ -x "$py" ] || continue
+    # Skip Xcode stubs: they are tiny shell wrappers that exec xcrun
+    case "$(head -c 512 "$py" 2>/dev/null)" in
+      *xcrun*) continue ;;
+    esac
+    printf '%s' "$py"
+    return 0
+  done
+  return 1
+}
+
+PY=$(_find_real_python 2>/dev/null || true)
+[ "$DEBUG" -eq 1 ] && printf 'DEBUG: resolved python=%s\n' "${PY:-(none)}" >&2
 HAS_MSGUNFMT=0
 if command -v msgunfmt >/dev/null 2>&1; then HAS_MSGUNFMT=1; fi
 
@@ -753,9 +789,92 @@ PYCODE
         exit 0
       fi
     else
-      echo "error: JSON/YAML/-n modes require python or msgunfmt." >&2
-      exit 2
+      # Neither python nor msgunfmt: -n N can still use the od/awk fallback
+      # (defined below).  JSON/YAML require one of the above tools.
+      if [ "$N_STRINGS" -le 0 ]; then
+        echo "error: JSON/YAML output requires python or msgunfmt." >&2
+        exit 2
+      fi
+      # fall through — _mo_extract_n_awk will be called after its definition
     fi
+  fi
+fi
+
+# Last-resort fallback for -n N: extract msgstr strings from the .mo binary
+# using only od and awk (no Python, no msgunfmt required).
+#
+# GNU .mo format (little-endian magic 0x950412de):
+#   offset 8:  number of strings (N)
+#   offset 12: offset of original-string table (each entry: length u32 + offset u32)
+#   offset 16: offset of translated-string table (same layout)
+#
+# We read the string-offset table with od, then slice each msgstr out with dd.
+# This is intentionally best-effort: non-UTF-8 bytes and control chars are
+# dropped; empty msgstr and the header entry (msgid="") are skipped.
+#
+_mo_extract_n_awk() {
+  local mo="$1" n="$2"
+  if ! command -v od >/dev/null 2>&1; then
+    return 1
+  fi
+
+  # Verify little-endian magic (0x950412de = 3725722334 decimal)
+  local magic
+  magic=$(od -A n -t u4 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+  [ "$magic" = "3725722334" ] || return 1
+
+  # Read header: num_strings at byte 8, trans_table_offset at byte 16
+  local num_strings trans_off
+  num_strings=$(od -A n -t u4 -j 8 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+  trans_off=$(od -A n -t u4 -j 16 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+
+  [ "${num_strings:-0}" -gt 0 ] || return 1
+
+  # Read original-string lengths to find the header entry (msgid "")
+  local orig_off
+  orig_off=$(od -A n -t u4 -j 12 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+
+  # Collect all msgstr values into a temp file
+  local tmp
+  tmp="$(mktemp -t mo_strs.XXXXXX 2>/dev/null || mktemp)"
+
+  local i str_len str_pos orig_len
+  for i in $(seq 0 $((num_strings - 1))); do
+    # Original entry: check that msgid is non-empty (skip header)
+    orig_len=$(od -A n -t u4 -j $((orig_off + i * 8)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    [ "${orig_len:-0}" -gt 0 ] || continue
+
+    # Translated entry: length and file offset
+    str_len=$(od -A n -t u4 -j $((trans_off + i * 8)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    str_pos=$(od -A n -t u4 -j $((trans_off + i * 8 + 4)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    [ "${str_len:-0}" -gt 0 ] || continue
+
+    # Extract the bytes; split on NUL first (plural forms separator) to take
+    # only the first plural form, then strip remaining control chars.
+    dd if="$mo" bs=1 skip="$str_pos" count="$str_len" 2>/dev/null \
+      | tr '\000' '\n' \
+      | head -1 \
+      | tr -d '\001-\010\013\014\016-\037' \
+      >> "$tmp" || true
+    printf '\n' >>"$tmp"
+  done
+
+  # Deduplicate, shuffle, and print n lines
+  awk '!seen[$0]++ && NF' "$tmp" \
+    | awk -v n="$n" 'BEGIN{srand()} {a[NR]=$0} END{for(i=1;i<=n&&i<=NR;i++){idx=int(rand()*NR)+1; print a[idx]}}'
+  rm -f "$tmp"
+  return 0
+}
+
+# Invoke the od/awk fallback if we reached here with N_STRINGS > 0
+# (means neither python nor msgunfmt handled it above)
+if [ "${N_STRINGS:-0}" -gt 0 ]; then
+  [ "$DEBUG" -eq 1 ] && echo "DEBUG: using od/awk .mo fallback extractor" >&2
+  if _mo_extract_n_awk "$selected" "$N_STRINGS"; then
+    exit 0
+  else
+    echo "error: .mo extraction failed; no python, msgunfmt, or od available." >&2
+    exit 2
   fi
 fi
 
