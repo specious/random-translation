@@ -28,7 +28,7 @@ set -euo pipefail
 # Avoid Python BrokenPipe tracebacks when consumer (yq/jq) closes early
 trap '' PIPE
 
-VERSION="0.0.0"
+VERSION="1.0.0"
 
 usage() {
   cat <<'EOF'
@@ -115,51 +115,129 @@ if [ -n "${LANG_CODES:-}" ]; then
   LANGS="${LANGS} ${LANG_CODES}"
 fi
 
+#
 # Cache setup
-XDG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}"
-CACHE_DIR="${CACHE_DIR:-$XDG_CACHE/random-translation}"
-CACHE_FILE="${CACHE_FILE:-$CACHE_DIR/mos.cache}"
-mkdir -p "$CACHE_DIR" 2>/dev/null || true
+#
+# Platform-aware bootstrap for GUI/minimal environments:
+#  - ensures HOME is set (tries passwd, falls back to /Users/$(whoami) or /home/$(whoami))
+#  - picks platform-appropriate cache defaults (macOS -> ~/Library/Caches, others -> ~/.cache)
+#  - allows overrides via XDG_CACHE_HOME, CACHE_DIR, CACHE_FILE env vars
+#  - creates the cache dir when possible and tolerates restricted environments
+#  - accepts a system-wide fallback cache at /var/cache/random-translation/mos.cache
+#  - supports --cache-stats and --strategy cached even when LANGS is empty
+#
 
-# If user asked for cache stats, print them and exit even if LANGS is empty
-if [ "${CACHE_STATS:-0}" -eq 1 ]; then
-  if [ -f "$CACHE_FILE" ]; then
-    if stat -f %m "$CACHE_FILE" >/dev/null 2>&1; then
-      mtime=$(stat -f %m "$CACHE_FILE")
+# Ensure HOME exists in minimal environments
+if [ -z "${HOME:-}" ]; then
+  if command -v getent >/dev/null 2>&1; then
+    HOME="$(getent passwd "$(id -u)" | cut -d: -f6 2>/dev/null || true)"
+  fi
+  HOME="${HOME:-/Users/$(whoami)}"
+  HOME="${HOME:-/home/$(whoami)}"
+  export HOME
+fi
+
+# Platform-aware default XDG cache location
+OS="$(uname -s 2>/dev/null || echo unknown)"
+case "$OS" in
+  Darwin*) DEFAULT_XDG="$HOME/Library/Caches" ;;
+  *)       DEFAULT_XDG="$HOME/.cache" ;;
+esac
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DEFAULT_XDG}"
+
+# Ensure CACHE_DIR has a sensible default before any use (avoids set -u errors)
+CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME}/random-translation}"
+CACHE_FILE="${CACHE_FILE:-${CACHE_DIR}/mos.cache}"
+
+# Resolve cache file from multiple canonical locations (respect explicit overrides)
+if [ -n "${CACHE_FILE:-}" ] && [ -f "${CACHE_FILE}" ]; then
+  : # explicit CACHE_FILE exists; keep it
+else
+  candidates=(
+    "${CACHE_FILE:-}"
+    "${CACHE_DIR:-}/mos.cache"
+    "${XDG_CACHE_HOME:-$HOME/.cache}/random-translation/mos.cache"
+    "$HOME/Library/Caches/random-translation/mos.cache"
+    "$HOME/.cache/random-translation/mos.cache"
+    "/var/cache/random-translation/mos.cache"
+  )
+
+  CACHE_FILE=""
+  for c in "${candidates[@]}"; do
+    [ -z "$c" ] && continue
+    if [ -f "$c" ]; then
+      CACHE_FILE="$c"
+      break
+    fi
+  done
+
+  # If none exist, pick preferred writable location for future writes
+  if [ -z "$CACHE_FILE" ]; then
+    if [ "$OS" = "Darwin" ]; then
+      CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/Library/Caches}/random-translation}"
     else
-      mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+      CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/random-translation}"
+    fi
+    CACHE_FILE="${CACHE_FILE:-$CACHE_DIR/mos.cache}"
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  fi
+fi
+
+# Ensure cache dir exists (no-op if already created); tolerate restricted envs
+mkdir -p "${CACHE_DIR:-}" 2>/dev/null || true
+
+# System-wide fallback
+SYSTEM_CACHE="/var/cache/random-translation/mos.cache"
+if [ -z "${CACHE_FILE:-}" ] || [ ! -f "${CACHE_FILE:-}" ]; then
+  if [ -f "$SYSTEM_CACHE" ]; then
+    CACHE_FILE="$SYSTEM_CACHE"
+  fi
+fi
+
+# Debug trace of chosen cache
+if [ "${DEBUG:-0}" -eq 1 ]; then
+  echo "DEBUG: resolved CACHE_DIR=${CACHE_DIR:-}" >&2
+  echo "DEBUG: resolved CACHE_FILE=${CACHE_FILE:-}" >&2
+fi
+
+# --cache-stats should work without LANGS
+if [ "${CACHE_STATS:-0}" -eq 1 ]; then
+  if [ -f "${CACHE_FILE:-}" ]; then
+    if stat -f %m "${CACHE_FILE}" >/dev/null 2>&1; then
+      mtime=$(stat -f %m "${CACHE_FILE}")
+    else
+      mtime=$(stat -c %Y "${CACHE_FILE}" 2>/dev/null || echo 0)
     fi
     now=$(date +%s)
     age=$((now - mtime))
-    count=$(wc -l <"$CACHE_FILE" 2>/dev/null || echo 0)
-    printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "$CACHE_FILE" "$count" "$age"
+    count=$(wc -l <"${CACHE_FILE}" 2>/dev/null || echo 0)
+    printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "${CACHE_FILE}" "$count" "$age"
     exit 0
   else
-    echo "Cache file not found: $CACHE_FILE" >&2
+    echo "Cache file not found: ${CACHE_FILE:-}" >&2
     exit 0
   fi
 fi
 
-# Helpful behavior: if user asked for --strategy cached but provided no LANGS,
-# show a short diagnostic about the cache (instead of falling through to usage).
+# If strategy cached and no LANGS, show cache status (helpful for GUI)
 if [ "${STRATEGY:-}" = "cached" ] && [ -z "${LANGS:-}" ]; then
-  if [ -f "$CACHE_FILE" ]; then
-    if stat -f %m "$CACHE_FILE" >/dev/null 2>&1; then
-      mtime=$(stat -f %m "$CACHE_FILE")
+  if [ -f "${CACHE_FILE:-}" ]; then
+    if stat -f %m "${CACHE_FILE}" >/dev/null 2>&1; then
+      mtime=$(stat -f %m "${CACHE_FILE}")
     else
-      mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+      mtime=$(stat -c %Y "${CACHE_FILE}" 2>/dev/null || echo 0)
     fi
     now=$(date +%s)
     age=$((now - mtime))
-    count=$(wc -l <"$CACHE_FILE" 2>/dev/null || echo 0)
+    count=$(wc -l <"${CACHE_FILE}" 2>/dev/null || echo 0)
     echo "Note: --strategy cached implies --cache-mode read; showing cache status." >&2
-    printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "$CACHE_FILE" "$count" "$age"
+    printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "${CACHE_FILE}" "$count" "$age"
     echo >&2
     echo "To sample translations, provide one or more LANGS, e.g.:" >&2
     echo "  random-translation -n 1 el tr es" >&2
     exit 0
   else
-    echo "error: strategy 'cached' requires an existing cache file: $CACHE_FILE" >&2
+    echo "error: strategy 'cached' requires an existing cache file: ${CACHE_FILE:-}" >&2
     echo "Hint: build the cache with --strategy indexed --cache-mode write --refresh LANG" >&2
     exit 3
   fi
