@@ -116,26 +116,53 @@ if [ -n "${LANG_CODES:-}" ]; then
 fi
 
 #
-# Cache setup
+# Container-aware HOME / XDG bootstrap
 #
-# Platform-aware bootstrap for GUI/minimal environments:
-#  - ensures HOME is set (tries passwd, falls back to /Users/$(whoami) or /home/$(whoami))
-#  - picks platform-appropriate cache defaults (macOS -> ~/Library/Caches, others -> ~/.cache)
-#  - allows overrides via XDG_CACHE_HOME, CACHE_DIR, CACHE_FILE env vars
-#  - creates the cache dir when possible and tolerates restricted environments
-#  - accepts a system-wide fallback cache at /var/cache/random-translation/mos.cache
-#  - supports --cache-stats and --strategy cached even when LANGS is empty
+# This block ensures the script behaves correctly when launched from GUI apps
+# (screensavers, launchd, etc.) that may provide a minimal or containerized HOME.
+# It:
+#  - tries to resolve a real system home (getent/dscl/ /etc/passwd) when HOME is unset
+#  - if HOME looks containerized, prefers the system home when available
+#  - sets platform-appropriate XDG default (macOS -> ~/Library/Caches, others -> ~/.cache)
+#  - leaves HOME alone if no better candidate is found
 #
 
-# Ensure HOME exists in minimal environments
-if [ -z "${HOME:-}" ]; then
+# helper: get home from system user DB (portable)
+_get_system_home() {
   if command -v getent >/dev/null 2>&1; then
-    HOME="$(getent passwd "$(id -u)" | cut -d: -f6 2>/dev/null || true)"
+    getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true
+    return
   fi
-  HOME="${HOME:-/Users/$(whoami)}"
+
+  if command -v dscl >/dev/null 2>&1; then
+    user="$(id -un 2>/dev/null || true)"
+    if [ -n "$user" ]; then
+      dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true
+      return
+    fi
+  fi
+
+  awk -F: -v uid="$(id -u)" '$3==uid {print $6; exit}' /etc/passwd 2>/dev/null || true
+}
+
+# If HOME unset, try to populate it from system DB or sensible fallback
+if [ -z "${HOME:-}" ]; then
+  syshome="$(_get_system_home)"
+  HOME="${syshome:-/Users/$(whoami)}"
   HOME="${HOME:-/home/$(whoami)}"
   export HOME
 fi
+
+# If HOME looks like a container/sandbox path, try to prefer the system home
+case "${HOME:-}" in
+  */Library/Containers/*|*/Containers/*|*/private/var/containers/*|*/Library/Application\ Support/*)
+    syshome="$(_get_system_home)"
+    if [ -n "$syshome" ] && [ "$syshome" != "$HOME" ] && [ -d "$syshome" ]; then
+      HOME="$syshome"
+      export HOME
+    fi
+    ;;
+esac
 
 # Platform-aware default XDG cache location
 OS="$(uname -s 2>/dev/null || echo unknown)"
@@ -219,7 +246,7 @@ if [ "${CACHE_STATS:-0}" -eq 1 ]; then
   fi
 fi
 
-# If strategy cached and no LANGS, show cache status (helpful for GUI)
+# If strategy cached and no LANGS, show cache status (instead of falling through to usage).
 if [ "${STRATEGY:-}" = "cached" ] && [ -z "${LANGS:-}" ]; then
   if [ -f "${CACHE_FILE:-}" ]; then
     if stat -f %m "${CACHE_FILE}" >/dev/null 2>&1; then
@@ -245,7 +272,10 @@ fi
 
 # Normalize languages: convert commas to spaces, trim
 LANGS=$(printf '%s\n' "$LANGS" | awk 'BEGIN{ORS=" "} {gsub(/,/," "); for(i=1;i<=NF;i++) print $i}' | sed 's/^ *//; s/ *$//')
-if [ -z "$LANGS" ]; then
+
+# Only require LANGS when the user actually needs to select translations.
+# Allow --cache-stats and --strategy cached to run without LANGS.
+if [ -z "$LANGS" ] && [ "${CACHE_STATS:-0}" -eq 0 ] && [ "${STRATEGY:-}" != "cached" ]; then
   echo "error: no language specified. Provide one or more language codes as arguments." >&2
   usage
 fi
@@ -379,8 +409,8 @@ case "$CACHE_MODE" in
     if [ "$REFRESH" -eq 1 ]; then
       rebuild_cache=1
     else
-      if [ ! -f "$CACHE_FILE" ]; then
-        echo "error: cache-mode=read but no cache file exists: $CACHE_FILE" >&2
+      if [ ! -f "${CACHE_FILE:-}" ]; then
+        echo "error: cache-mode=read but no cache file exists: ${CACHE_FILE:-}" >&2
         exit 3
       fi
       [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache-mode=read → using existing cache" >&2
@@ -389,14 +419,14 @@ case "$CACHE_MODE" in
 
   write)
     # Write mode: rebuild if refresh, missing, or TTL expired
-    if [ "$REFRESH" -eq 1 ] || [ ! -f "$CACHE_FILE" ]; then
+    if [ "$REFRESH" -eq 1 ] || [ ! -f "${CACHE_FILE:-}" ]; then
       rebuild_cache=1
     else
       now=$(date +%s)
-      if stat -f %m "$CACHE_FILE" >/dev/null 2>&1; then
-        mtime=$(stat -f %m "$CACHE_FILE")
+      if stat -f %m "${CACHE_FILE}" >/dev/null 2>&1; then
+        mtime=$(stat -f %m "${CACHE_FILE}")
       else
-        mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "${CACHE_FILE}" 2>/dev/null || echo 0)
       fi
       age=$((now - mtime))
       [ "$age" -ge "$TTL" ] && rebuild_cache=1
@@ -414,8 +444,9 @@ if [ "$rebuild_cache" -eq 1 ]; then
   discover_mo_list "$STRATEGY" "$TMP_CACHE" "$DEBUG" "$ROOTS"
 
   if [ "$CACHE_MODE" = "write" ]; then
+    mkdir -p "$(dirname "${CACHE_FILE}")" 2>/dev/null || true
     mv "$TMP_CACHE" "$CACHE_FILE"
-    [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache written with $(wc -l <"$CACHE_FILE" | tr -d ' ') entries" >&2
+    [ "$DEBUG" -eq 1 ] && echo "DEBUG: cache written with $(wc -l <"${CACHE_FILE}" | tr -d ' ') entries" >&2
   else
     # transient list for this run
     CACHE_FILE="$TMP_CACHE"
@@ -424,15 +455,12 @@ if [ "$rebuild_cache" -eq 1 ]; then
 
 else
   # Only reached for cache-mode read/write when rebuild not required
-  [ "$DEBUG" -eq 1 ] && echo "DEBUG: using existing cache file: $CACHE_FILE (mode=$CACHE_MODE)" >&2
+  [ "$DEBUG" -eq 1 ] && echo "DEBUG: using existing cache file: ${CACHE_FILE:-} (mode=$CACHE_MODE)" >&2
 fi
 
 # Ensure cache file exists and has entries
-if [ ! -s "$CACHE_FILE" ]; then
+if [ ! -s "${CACHE_FILE:-}" ]; then
   # Only call it "cache empty" when we actually consulted a persistent cache (cache-mode read/write and not transient).
-  # If the quick discovery strategy was used (the default) it may not find .mo files on some systems
-  # (macOS and some package layouts place locale data in locations not covered by the shallow quick scan).
-  # Provide a helpful explanation and a short tutorial on how to build a persistent cache.
   if [ "$CACHE_MODE" = "read" ] || [ "$CACHE_MODE" = "write" ]; then
     echo >&2
     echo "No .mo files found (cache empty)." >&2
@@ -497,10 +525,10 @@ while IFS= read -r f; do
       *) case "$lcnorm" in "$wantn"*) printf '%s\n' "$f" >>"$TMP_MATCH"; break ;; esac ;;
     esac
   done
-done <"$CACHE_FILE"
+done <"${CACHE_FILE}"
 
 if [ ! -s "$TMP_MATCH" ]; then
-  [ "$DEBUG" -eq 1 ] && { echo "DEBUG: cache sample (first 50):" >&2; head -n 50 "$CACHE_FILE" >&2 || true; }
+  [ "$DEBUG" -eq 1 ] && { echo "DEBUG: cache sample (first 50):" >&2; head -n 50 "${CACHE_FILE}" >&2 || true; }
   echo "No .mo files found for languages: $LANGS" >&2
   exit 3
 fi
