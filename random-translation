@@ -21,18 +21,17 @@
 #  1 usage / argument error
 #  2 missing tools for extraction
 #  3 no matches found
-#  4 selection failure
 
 set -euo pipefail
 
-# Avoid Python BrokenPipe tracebacks when consumer (yq/jq) closes early
-trap '' PIPE
+# Restore default SIGPIPE handling so the script exits when a downstream consumer closes the pipe
+trap - PIPE 2>/dev/null || true
 
 VERSION="1.0.0"
 
 usage() {
   cat <<'EOF'
-Usage: [options] LANGS...
+Usage: random-translation [options] LANGS...
 
   LANGS may be one or more language codes (space or comma separated).
 
@@ -148,8 +147,11 @@ _get_system_home() {
 # If HOME unset, try to populate it from system DB or sensible fallback
 if [ -z "${HOME:-}" ]; then
   syshome="$(_get_system_home)"
-  HOME="${syshome:-/Users/$(whoami)}"
-  HOME="${HOME:-/home/$(whoami)}"
+  HOME="${syshome:-}"
+  if [ -z "$HOME" ]; then
+    HOME="/Users/$(whoami 2>/dev/null || echo user)"
+    [ -d "$HOME" ] || HOME="/home/$(whoami 2>/dev/null || echo user)"
+  fi
   export HOME
 fi
 
@@ -348,7 +350,7 @@ discover_mo_list() {
         mdfind "kMDItemFSName == '*.mo'c" 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
       elif command -v locate >/dev/null 2>&1; then
         [ "$debug" -eq 1 ] && echo "DEBUG: using locate" >&2
-        locate --existing '*.mo' 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
+        locate '*.mo' 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
       else
         [ "$debug" -eq 1 ] && echo "DEBUG: no indexer found; falling back to limited find" >&2
         for d in /usr/share /usr/local /opt /Applications; do
@@ -371,7 +373,7 @@ discover_mo_list() {
 
     deep)
       [ "$debug" -eq 1 ] && echo "DEBUG: deep strategy full scan (may be slow)" >&2
-      find / -type f -iname '*.mo' -maxdepth 8 -path '/System' -prune -o -path '/private/var' -prune -o -path '/Volumes' -prune -o -print 2>/dev/null | grep -i '\.mo$' >>"$cache" || true
+      find / -maxdepth 8 2>/dev/null \( -path '/System' -o -path '/private/var' -o -path '/Volumes' -o -path '/proc' \) -prune -o -type f -iname '*.mo' -print | grep -i '\.mo$' >>"$cache" || true
       ;;
 
     cached)
@@ -439,7 +441,8 @@ esac
 # Build or load cache according to rebuild decision
 if [ "$rebuild_cache" -eq 1 ]; then
   TMP_CACHE="$(mktemp -t mos.cache.XXXXXX 2>/dev/null || mktemp)"
-  trap 'rm -f "$TMP_CACHE"' EXIT
+  _CLEANUP_TMP_CACHE="$TMP_CACHE"
+  trap 'rm -f "${_CLEANUP_TMP_CACHE:-}" "${_CLEANUP_TMP_MATCH:-}"' EXIT
 
   discover_mo_list "$STRATEGY" "$TMP_CACHE" "$DEBUG" "$ROOTS"
 
@@ -501,7 +504,9 @@ NORMALS=$(printf '%s\n' "$NORMALS" | sed 's/^ *//; s/ *$//')
 
 # Filter cache by LOCALE_DIRS and languages
 TMP_MATCH="$(mktemp -t mos.match.XXXXXX 2>/dev/null || mktemp)"
-trap 'rm -f "$TMP_MATCH"' EXIT
+_CLEANUP_TMP_MATCH="$TMP_MATCH"
+# Update the combined cleanup trap now that TMP_MATCH is known
+trap 'rm -f "${_CLEANUP_TMP_CACHE:-}" "${_CLEANUP_TMP_MATCH:-}"' EXIT
 
 while IFS= read -r f; do
   # If cache-mode=none we skip LOCALE_DIRS filtering because discovery may have returned paths outside LOCALE_DIRS
@@ -600,10 +605,11 @@ if command -v msgunfmt >/dev/null 2>&1; then HAS_MSGUNFMT=1; fi
 if [ "$OUTPUT_MODE" = "json" ] || [ "$OUTPUT_MODE" = "yaml" ] || [ "$N_STRINGS" -gt 0 ]; then
   if [ -n "$PY" ]; then
     if [ "$OUTPUT_MODE" = "json" ]; then
-      "$PY" - "$selected" <<'PYCODE'
+      "$PY" - "$selected" "$N_STRINGS" <<'PYCODE'
 import sys, json, random
 from gettext import GNUTranslations
 p = sys.argv[1]
+n = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 try:
     with open(p,'rb') as fh:
         t = GNUTranslations(fh)
@@ -615,10 +621,13 @@ out=[]
 for k,v in cat.items():
     if k == '':
         continue
-    # Plural forms note: if k is a tuple (plural forms), pick one at random so output varies across runs.
+    # Plural forms: if k is a tuple, pick one at random so output varies across runs.
     if isinstance(k,tuple):
         k = random.choice(k)
     out.append({"msgid":k,"msgstr":v})
+if n > 0:
+    random.shuffle(out)
+    out = out[:n]
 print(json.dumps(out, ensure_ascii=False))
 PYCODE
       exit 0
@@ -626,10 +635,11 @@ PYCODE
 
     if [ "$OUTPUT_MODE" = "yaml" ]; then
       # Python YAML emitter: preserve Unicode, replace tabs with two spaces, sanitize control chars
-      "$PY" - "$selected" <<'PYCODE'
+      "$PY" - "$selected" "$N_STRINGS" <<'PYCODE'
 import sys, re, random
 from gettext import GNUTranslations
 p = sys.argv[1]
+n = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 try:
     with open(p,'rb') as fh:
         t = GNUTranslations(fh)
@@ -650,10 +660,12 @@ def safe_lines(s):
     lines = text.splitlines() or ['']
     return lines
 
-for k,v in cat.items():
-    if k == '':
-        continue
-    # Plural forms note: if k is a tuple (plural forms), pick one at random so output varies across runs.
+items = [(k,v) for k,v in cat.items() if k != '']
+if n > 0:
+    random.shuffle(items)
+    items = items[:n]
+for k,v in items:
+    # Plural forms: if k is a tuple, pick one at random so output varies across runs.
     if isinstance(k,tuple):
         k = random.choice(k)
     print("- msgid: |")
@@ -679,27 +691,24 @@ except Exception as e:
     sys.stderr.write("python: failed to read .mo: %s\n" % e)
     sys.exit(1)
 cat = getattr(t,'_catalog',{}) or {}
-vals = []
+pairs = []
+seen = set()
 for k,v in cat.items():
-    if k == '':
+    if k == '' or not v:
         continue
-    # Plural forms note: if k is a tuple (plural forms), pick one at random so msgstr selection can vary.
     if isinstance(k,tuple):
         k = random.choice(k)
-    if v:
-        vals.append(v)
-if not vals:
+    if k not in seen:
+        seen.add(k)
+        pairs.append((k,v))
+if not pairs:
     sys.exit(0)
-# unique and shuffle
-seen = set()
-uniq = []
-for s in vals:
-    if s not in seen:
-        seen.add(s)
-        uniq.append(s)
-random.shuffle(uniq)
-for s in uniq[:n]:
-    print(s)
+random.shuffle(pairs)
+for k,v in pairs[:n]:
+    import json
+    print('msgid ' + json.dumps(k, ensure_ascii=False))
+    print('msgstr ' + json.dumps(v, ensure_ascii=False))
+    print()
 PYCODE
       exit 0
     fi
@@ -781,11 +790,35 @@ PYCODE
       fi
 
       if [ "$N_STRINGS" -gt 0 ]; then
-        msgunfmt "$selected" | awk '/^msgstr /{sub(/^msgstr /,""); gsub(/^"/,""); gsub(/"$/,""); print}' | awk '!seen[$0]++' >"${CACHE_DIR}/.tmp_strs"
-        total=$(wc -l <"${CACHE_DIR}/.tmp_strs" | tr -d ' ')
-        if [ "$total" -eq 0 ]; then exit 0; fi
-        awk -v n="$N_STRINGS" 'BEGIN{srand()} {a[NR]=$0} END{for(i=1;i<=n && i<=NR;i++){idx=int(rand()*NR)+1; print a[idx]}}' "${CACHE_DIR}/.tmp_strs"
-        rm -f "${CACHE_DIR}/.tmp_strs"
+        # Collect each msgid/msgstr paragraph from msgunfmt output, skip the
+        # PO header (empty msgid), pick N at random, and print them.
+        msgunfmt "$selected" | awk -v n="$N_STRINGS" '
+          BEGIN { RS=""; ORS="" }
+          # Skip the header entry (msgid "")
+          /^msgid ""/ { next }
+          { records[NR] = $0 }
+          END {
+            srand()
+            total = length(records)
+            printed = 0
+            while (printed < n && total > 0) {
+              # pick a random remaining key
+              target = int(rand() * total) + 1
+              i = 0
+              for (k in records) {
+                i++
+                if (i == target) {
+                  print records[k] "
+"
+                  delete records[k]
+                  total--
+                  printed++
+                  break
+                }
+              }
+            }
+          }
+        '
         exit 0
       fi
     else
@@ -800,7 +833,7 @@ PYCODE
   fi
 fi
 
-# Last-resort fallback for -n N: extract msgstr strings from the .mo binary
+# Last-resort fallback for -n N: extract msgid/msgstr pairs from the .mo binary
 # using only od and awk (no Python, no msgunfmt required).
 #
 # GNU .mo format (little-endian magic 0x950412de):
@@ -808,9 +841,8 @@ fi
 #   offset 12: offset of original-string table (each entry: length u32 + offset u32)
 #   offset 16: offset of translated-string table (same layout)
 #
-# We read the string-offset table with od, then slice each msgstr out with dd.
-# This is intentionally best-effort: non-UTF-8 bytes and control chars are
-# dropped; empty msgstr and the header entry (msgid="") are skipped.
+# This is intentionally best-effort: non-printable bytes and control chars are
+# stripped; empty entries and the header (msgid="") are skipped.
 #
 _mo_extract_n_awk() {
   local mo="$1" n="$2"
@@ -823,45 +855,50 @@ _mo_extract_n_awk() {
   magic=$(od -A n -t u4 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
   [ "$magic" = "3725722334" ] || return 1
 
-  # Read header: num_strings at byte 8, trans_table_offset at byte 16
-  local num_strings trans_off
-  num_strings=$(od -A n -t u4 -j 8 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
-  trans_off=$(od -A n -t u4 -j 16 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
-
+  # Read header fields
+  local num_strings orig_off trans_off
+  num_strings=$(od -A n -t u4 -j 8  -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+  orig_off=$(   od -A n -t u4 -j 12 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+  trans_off=$(  od -A n -t u4 -j 16 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
   [ "${num_strings:-0}" -gt 0 ] || return 1
 
-  # Read original-string lengths to find the header entry (msgid "")
-  local orig_off
-  orig_off=$(od -A n -t u4 -j 12 -N 4 "$mo" 2>/dev/null | tr -d ' \n')
-
-  # Collect all msgstr values into a temp file
+  # Collect msgid/msgstr pairs into a temp file, one pair per two lines
   local tmp
-  tmp="$(mktemp -t mo_strs.XXXXXX 2>/dev/null || mktemp)"
+  tmp="$(mktemp -t mo_pairs.XXXXXX 2>/dev/null || mktemp)"
 
-  local i str_len str_pos orig_len
+  _extract_str() {
+    dd if="$mo" bs=1 skip="$1" count="$2" 2>/dev/null       | tr '\000' '\n'       | head -1       | tr -d '\001-\010\013\014\016-\037'
+  }
+
+  local i orig_len orig_pos str_len str_pos msgid msgstr
   for i in $(seq 0 $((num_strings - 1))); do
-    # Original entry: check that msgid is non-empty (skip header)
-    orig_len=$(od -A n -t u4 -j $((orig_off + i * 8)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    orig_len=$(od -A n -t u4 -j $((orig_off  + i * 8))     -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    orig_pos=$(od -A n -t u4 -j $((orig_off  + i * 8 + 4)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    str_len=$( od -A n -t u4 -j $((trans_off + i * 8))     -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    str_pos=$( od -A n -t u4 -j $((trans_off + i * 8 + 4)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
+    # skip header (empty msgid) and empty translations
     [ "${orig_len:-0}" -gt 0 ] || continue
-
-    # Translated entry: length and file offset
-    str_len=$(od -A n -t u4 -j $((trans_off + i * 8)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
-    str_pos=$(od -A n -t u4 -j $((trans_off + i * 8 + 4)) -N 4 "$mo" 2>/dev/null | tr -d ' \n')
-    [ "${str_len:-0}" -gt 0 ] || continue
-
-    # Extract the bytes; split on NUL first (plural forms separator) to take
-    # only the first plural form, then strip remaining control chars.
-    dd if="$mo" bs=1 skip="$str_pos" count="$str_len" 2>/dev/null \
-      | tr '\000' '\n' \
-      | head -1 \
-      | tr -d '\001-\010\013\014\016-\037' \
-      >> "$tmp" || true
-    printf '\n' >>"$tmp"
+    [ "${str_len:-0}"  -gt 0 ] || continue
+    msgid=$(  _extract_str "$orig_pos" "$orig_len")
+    msgstr=$( _extract_str "$str_pos"  "$str_len")
+    [ -n "$msgid" ] && [ -n "$msgstr" ] || continue
+    printf '%s\t%s\n' "$msgid" "$msgstr" >> "$tmp"
   done
 
-  # Deduplicate, shuffle, and print n lines
-  awk '!seen[$0]++ && NF' "$tmp" \
-    | awk -v n="$n" 'BEGIN{srand()} {a[NR]=$0} END{for(i=1;i<=n&&i<=NR;i++){idx=int(rand()*NR)+1; print a[idx]}}'
+  # Deduplicate by msgid, shuffle, pick n, and print as msgid/msgstr pairs
+  awk -v n="$n" '
+    !seen[$1]++ { a[NR]=$0 }
+    END {
+      srand()
+      for (i=1; i<=n && i<=NR; i++) {
+        idx = int(rand()*NR)+1
+        split(a[idx], p, "\t")
+        print "msgid "  p[1]
+        print "msgstr " p[2]
+        print ""
+      }
+    }
+  ' "$tmp"
   rm -f "$tmp"
   return 0
 }
