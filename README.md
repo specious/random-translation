@@ -6,6 +6,25 @@ languages and emit translations.**
 Ideal for testing, demos, language learning, and screensavers. Portable, blazing fast when cached,
 and works on macOS, Linux, and other Unix-like systems.
 
+```
+┌───=[ me :: station ]-( 0 )-[ ~ ]
+└──( random-translation --strategy cached pt -n 3 --output json
+[
+  {
+    "msgid": "An extension was expected but was not seen",
+    "msgstr": "Uma extensão era esperada, mas não foi vista"
+  },
+  {
+    "msgid": "A packet with illegal or unsupported version was received.",
+    "msgstr": "Um pacote com versão ilegal ou sem suporte foi recebido."
+  },
+  {
+    "msgid": "No supported cipher suites have been found.",
+    "msgstr": "Nenhum conjunto de cifras com suporte foi localizado."
+  }
+]
+```
+
 ## Features
 
 - **Discovery strategies:** `quick`, `indexed`, `targeted`, `deep`, `cached`
@@ -97,8 +116,9 @@ random-translation fr --strategy targeted --roots "/usr/share/locale:/opt/myapp/
 
 ## Using with Phosphor and XScreenSaver
 
-Phosphor is a retro terminal-style screensaver that can display text produced by a shell
-command. Different builds and front ends expose the command field under different names:
+[Phosphor](https://man.archlinux.org/man/extra/xscreensaver/phosphor.6.en) is a retro
+terminal-style screensaver that can display text produced by a shell command. Different
+builds and front ends expose the command field under different names:
 
 - On macOS (e.g. `brew install xscreensaver`) the field is usually labeled **Shell Cmd**
   under Display Text in the Phosphor settings dialog.
@@ -107,7 +127,8 @@ command. Different builds and front ends expose the command field under differen
 ### PATH note
 
 XScreenSaver runs with a minimal environment and typically does not include `/usr/local/bin`
-in `PATH`. Always use the **full path** to the script:
+in `PATH`. On Linux that directory is usually already in the default PATH, so the bare
+`random-translation` works; on macOS it’s easiest to point Phosphor at the absolute path:
 
 ```
 /usr/local/bin/random-translation --strategy cached de

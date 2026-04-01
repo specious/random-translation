@@ -27,7 +27,7 @@ set -euo pipefail
 # Restore default SIGPIPE handling so the script exits when a downstream consumer closes the pipe
 trap - PIPE 2>/dev/null || true
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 usage() {
   cat <<'EOF'
@@ -1077,7 +1077,7 @@ PYCODE
     fi
 
     if [ "$N_STRINGS" -gt 0 ]; then
-      "$PY" - "$selected" "$N_STRINGS" <<'PYCODE'
+      "$PY" - "$selected" "$N_STRINGS" <<'PYCODE' | _format_normal_po
 import sys, random
 from gettext import GNUTranslations
 p = sys.argv[1]
@@ -1218,7 +1218,7 @@ PYCODE
               }
             }
           }
-        '
+        ' | _format_normal_po
         exit 0
       fi
     else
@@ -1307,9 +1307,13 @@ _mo_extract_n_awk() {
 # (means neither python nor msgunfmt handled it above)
 if [ "${N_STRINGS:-0}" -gt 0 ]; then
   [ "$DEBUG" -eq 1 ] && echo "DEBUG: using od/awk .mo fallback extractor" >&2
-  if _mo_extract_n_awk "$selected" "$N_STRINGS"; then
+  tmp_fallback="$(mktemp -t mo_extract.XXXXXX 2>/dev/null || mktemp)"
+  if _mo_extract_n_awk "$selected" "$N_STRINGS" >"$tmp_fallback"; then
+    cat "$tmp_fallback" | _format_normal_po
+    rm -f "$tmp_fallback"
     exit 0
   else
+    rm -f "$tmp_fallback"
     echo "error: .mo extraction failed; no python, msgunfmt, or od available." >&2
     exit 2
   fi
