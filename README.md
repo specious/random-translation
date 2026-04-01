@@ -3,7 +3,7 @@
 **A small, portable tool to pick a random installed GNU gettext `.mo` file for one or more
 languages and emit translations.**
 
-Ideal for testing, demos, language learning, and screensavers. Portable, fast when cached,
+Ideal for testing, demos, language learning, and screensavers. Portable, blazing fast when cached,
 and works on macOS, Linux, and other Unix-like systems.
 
 ## Features
@@ -11,6 +11,7 @@ and works on macOS, Linux, and other Unix-like systems.
 - **Discovery strategies:** `quick`, `indexed`, `targeted`, `deep`, `cached`
 - **Cache control:** `read`, `write`, `none` with TTL and `--refresh`
 - **Output formats:** `normal` (PO-like), `json`, `yaml`, `filename`
+- **Readable output:** optional ANSI colors, optional PO header (`-H`), optional metadata (`--meta`)
 - **Sampling:** print `-n N` random translated strings (great for screensavers)
 - **Locale matching:** `es`, `es_ES`, `es-ES`, `es_ES.UTF-8`
 - **Fallbacks:** uses `python3` or `msgunfmt` when available; pure `od`/`awk` otherwise
@@ -43,6 +44,11 @@ random-translation --strategy indexed --cache-mode write --refresh el tr es hu
 ```
 
 After building the cache you can use `--strategy cached` for near-instant runs.
+For best performance, always build once first, then run in cached read mode:
+
+```bash
+random-translation --strategy cached --cache-mode read el tr es hu
+```
 
 ## Quickstart
 
@@ -62,6 +68,19 @@ Emit JSON for programmatic use:
 
 ```bash
 random-translation es --output json
+```
+
+Include header metadata in structured output:
+
+```bash
+random-translation es --output json --header
+random-translation es --output yaml --header
+```
+
+Show context metadata in normal PO-like output:
+
+```bash
+random-translation es --meta
 ```
 
 Show the path that would be read without reading it:
@@ -129,6 +148,7 @@ phosphor --scale 4 --delay 80000 --pipe --program '/usr/local/bin/random-transla
 ## Tips for screensaver use and language learning
 
 - **Build the cache first** with `--strategy deep` for the languages you care about.
+- **Use cached read mode** for day-to-day runs: `--strategy cached --cache-mode read`.
 - **Use `-n 1`** for single-line displays; use `-n N` for multi-line bursts.
 - **Mix languages** on the command line to rotate phrases from multiple targets.
 - **Use `--roots` + `--strategy targeted`** to include app-specific locale directories.
@@ -178,6 +198,10 @@ Options
   --refresh           Force rebuild of the .mo list (applies when cache-mode is write or when using transient cache)
   --ttl SECS          Cache TTL in seconds (default 3600)
   --debug             Print debug information showing what each strategy and cache decision does
+  -H, --header        Include PO header metadata in output (default: hidden)
+  --meta              Include metadata entries in normal output (e.g. msgctxt)
+  --color WHEN        Colorize output: auto|always|never (default: auto)
+  --no-color          Alias for --color never
   -n N                Print N random msgstr strings only (useful for screensavers)
   --output MODE       Output mode: normal|json|yaml|filename  (default: normal)
   --cache-stats       Print cache age and entry count then exit
