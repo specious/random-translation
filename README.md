@@ -8,7 +8,7 @@ and works on macOS, Linux, and other Unix-like systems.
 
 ```
 ┌───=[ me :: station ]-( 0 )-[ ~ ]
-└──( random-translation --strategy cached pt -n 3 --output json
+└──( random-translation pt -n 3 --output json
 [
   {
     "msgid": "An extension was expected but was not seen",
@@ -27,7 +27,8 @@ and works on macOS, Linux, and other Unix-like systems.
 
 ## Features
 
-- **Discovery strategies:** `quick`, `indexed`, `targeted`, `deep`, `cached`
+- **Default behavior:** deep cache build on first run, cached lookup thereafter
+- **Manual strategies:** `auto`, `quick`, `indexed`, `targeted`, `deep`, `cached`
 - **Cache control:** `read`, `write`, `none` with TTL and `--refresh`
 - **Output formats:** `normal` (PO-like), `json`, `yaml`, `filename`
 - **Readable output:** optional ANSI colors, optional PO header (`-H`), optional metadata (`--meta`)
@@ -35,6 +36,8 @@ and works on macOS, Linux, and other Unix-like systems.
 - **Locale matching:** `es`, `es_ES`, `es-ES`, `es_ES.UTF-8`
 - **Fallbacks:** uses `python3` or `msgunfmt` when available; pure `od`/`awk` otherwise
 - **Debugging:** `--debug` shows discovery and cache decisions
+- **Modern XDG support:** honors `XDG_CACHE_HOME` (cache location) and `XDG_DATA_HOME/locale`
+  (per-user locale data) when present; defaults to sensible platform locations otherwise
 
 ## Install
 
@@ -48,30 +51,51 @@ sudo chown root:root /usr/local/bin/random-translation
 sudo chmod 755 /usr/local/bin/random-translation
 ```
 
-## Build a cache
+## Default behavior
 
-Building a cache once makes subsequent runs fast and reliable. The `deep` strategy does a
-full filesystem scan and is the most thorough; `indexed` uses `mdfind` (macOS) or `locate`
-(Linux) and is faster but may miss some locations.
+Running `random-translation LANGS...` with no cache flags is the recommended path. On the
+first run it performs a deep scan, writes the cache, and builds per-language indexes. On
+later runs it reuses that cache automatically for near-instant selection.
+
+XDG notes: the tool respects modern XDG environment variables. By default the cache
+is placed under `$XDG_CACHE_HOME/random-translation` (or `~/.cache/random-translation`), and
+per-user locale data directories under `$XDG_DATA_HOME/locale` (or `~/.local/share/locale`)
+are included in discovery. On macOS the cache defaults to `~/Library/Caches` when XDG
+variables are not set.
 
 ```bash
-# Thorough: full scan (slower, recommended for first-time setup)
-random-translation --strategy deep --cache-mode write --refresh el tr es hu
+# First run: deep scan + cache build
+random-translation sv,fi,pl
 
-# Fast: uses system indexer when available
-random-translation --strategy indexed --cache-mode write --refresh el tr es hu
+# Later runs: cached automatically
+random-translation sv,fi,pl
 ```
 
-After building the cache you can use `--strategy cached` for near-instant runs.
-For best performance, always build once first, then run in cached read mode:
+## Manual cache control
+
+If you want to manage cache behavior yourself, the manual modes are also available. `deep`
+is the most thorough; `indexed` uses `mdfind` (macOS) or `locate` (Linux) and is faster but
+may miss some locations.
+
+Cache-mode summary: `read` reuses the cache (fails if missing), `write` rebuilds it and respects
+`--refresh`, and `none` performs live discovery. Use `--refresh` with `read`/`write` to force a
+rebuild even before TTL expires. `--cache-init` runs `deep` + `write`, prints stats, and exits
+without picking a translation.
 
 ```bash
-random-translation --strategy cached --cache-mode read el tr es hu
+# Force a full rebuild
+random-translation --strategy deep --cache-mode write --refresh el tr es hu
+
+# Rebuild using the system indexer
+random-translation --strategy indexed --cache-mode write --refresh el tr es hu
+
+# Use only the existing cache
+random-translation --strategy cached el tr es hu
 ```
 
 ## Quickstart
 
-Pick a random Greek translation and print PO-like output:
+Pick a random Greek translation and print PO-like output. If no cache exists yet, this also builds it:
 
 ```bash
 random-translation el
@@ -131,7 +155,7 @@ in `PATH`. On Linux that directory is usually already in the default PATH, so th
 `random-translation` works; on macOS it’s easiest to point Phosphor at the absolute path:
 
 ```
-/usr/local/bin/random-translation --strategy cached de
+/usr/local/bin/random-translation de
 ```
 
 ### macOS sandbox note
@@ -141,15 +165,15 @@ which is blocked inside the App Sandbox that XScreenSaver/Phosphor runs in. The 
 automatically detects and skips this stub, preferring a real interpreter (e.g. from
 Homebrew at `/opt/homebrew/bin/python3` or `/usr/local/bin/python3`). If no real Python
 is found it falls back to a pure `od`/`awk` `.mo` reader that works without any external
-tools. Build the cache in a terminal first (see above) so no filesystem scan is needed
-at screensaver time.
+tools. Run the command once in a terminal first so the cache is ready before screensaver
+time.
 
 ### One-shot command
 
 Paste directly into Phosphor's Shell Cmd or Program field:
 
 ```
-/usr/local/bin/random-translation --strategy cached el,tr,es,hu
+/usr/local/bin/random-translation el,tr,es,hu
 ```
 
 ### Pipe mode
@@ -168,8 +192,8 @@ phosphor --scale 4 --delay 80000 --pipe --program '/usr/local/bin/random-transla
 
 ## Tips for screensaver use and language learning
 
-- **Build the cache first** with `--strategy deep` for the languages you care about.
-- **Use cached read mode** for day-to-day runs: `--strategy cached --cache-mode read`.
+- **Run it once in a terminal first** so the automatic cache is ready for later use.
+- **Use `--strategy cached`** when you want to guarantee cache-only behavior.
 - **Use `-n 1`** for single-line displays; use `-n N` for multi-line bursts.
 - **Mix languages** on the command line to rotate phrases from multiple targets.
 - **Use `--roots` + `--strategy targeted`** to include app-specific locale directories.
@@ -180,7 +204,8 @@ phosphor --scale 4 --delay 80000 --pipe --program '/usr/local/bin/random-transla
 
 **`No .mo files found`**
 
-- Build the cache: `random-translation --strategy deep --cache-mode write --refresh LANG`
+- Let auto mode build the cache: `random-translation LANG`
+- Or force a rebuild: `random-translation --strategy deep --cache-mode write --refresh LANG`
 - Use `--roots` with `--strategy targeted` to point at known locale directories
 - Use `--debug` to inspect discovery and cache decisions
 
@@ -214,7 +239,7 @@ Usage: random-translation [options] LANGS...
 
 Options
   --roots PATHS       Colon-separated roots to search (overrides default roots)
-  --strategy STR      Discovery strategy: quick|indexed|targeted|deep|cached
+  --strategy STR      Discovery strategy: auto|quick|indexed|targeted|deep|cached
   --cache-mode MODE   Cache behavior: read|write|none
   --refresh           Force rebuild of the .mo list (applies when cache-mode is write or when using transient cache)
   --ttl SECS          Cache TTL in seconds (default 3600)
@@ -225,7 +250,8 @@ Options
   --no-color          Alias for --color never
   -n N                Print N random msgstr strings only (useful for screensavers)
   --output MODE       Output mode: normal|json|yaml|filename  (default: normal)
-  --cache-stats       Print cache age and entry count then exit
+  --cache-stats       Print cache stats (entries, age, size) then exit
+  --cache-init        Build the cache (deep scan + write) and exit
   --version           Print version and exit
   --dry-run           Print the path that would be read and exit (alias for --output filename)
   -h, --help          Show this help
@@ -240,8 +266,7 @@ Exit codes
 ## Contributing
 
 Fork, add tests or improvements, and open a pull request. Keep changes portable and avoid
-platform-specific assumptions without guards. Add new discovery strategies behind the
-existing strategy dispatch and document them.
+platform-specific assumptions without guards. Consider adding new discovery strategies.
 
 ## License
 

@@ -3,11 +3,12 @@
 # Production-quality tool to pick a random installed .mo file for one or more languages
 # and output translations.
 #
-# Should work on macOS, Linux, and all *nix OS'es. Caching is disabled by default.
+# Should work on macOS, Linux, and all *nix OS'es. By default it auto-builds
+# a deep cache on first run, then uses cached lookups thereafter.
 #
 # Features
-#  - discovery strategies: quick, indexed, targeted, deep, cached
-#  - cache behavior control: read, write, none (none is default)
+#  - discovery strategies: auto, quick, indexed, targeted, deep, cached
+#  - cache behavior control: read, write, none
 #  - caching with TTL and refresh (only when cache-mode is read/write)
 #  - flexible output: normal|json|yaml|filename
 #  - return N random msgstr strings (-n N)
@@ -27,7 +28,7 @@ set -euo pipefail
 # Restore default SIGPIPE handling so the script exits when a downstream consumer closes the pipe
 trap - PIPE 2>/dev/null || true
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 usage() {
   cat <<'EOF'
@@ -40,9 +41,11 @@ Usage: random-translation [options] LANGS...
     - Comma list: "es,el,tr"
     - Locale variant: es_ES
 
+  Default behavior: auto deep-scan + cache build on first run, cached lookup thereafter.
+
 Options
   --roots PATHS       Colon-separated roots to search (overrides default roots)
-  --strategy STR      Discovery strategy: quick|indexed|targeted|deep|cached
+  --strategy STR      Discovery strategy: auto|quick|indexed|targeted|deep|cached
   --cache-mode MODE   Cache behavior: read|write|none
   --refresh           Force rebuild of the .mo list (applies when cache-mode is write or when using transient cache)
   --ttl SECS          Cache TTL in seconds (default 3600)
@@ -53,7 +56,8 @@ Options
   --no-color          Alias for --color never
   -n N                Print N random msgstr strings only (useful for screensavers)
   --output MODE       Output mode: normal|json|yaml|filename  (default: normal)
-  --cache-stats       Print cache age and entry count then exit
+  --cache-stats       Print cache stats (entries, age, size) then exit
+  --cache-init        Build the cache (deep scan + write) and exit
   --version           Print version and exit
   --dry-run           Print the path that would be read and exit (alias for --output filename)
   -h, --help          Show this help
@@ -63,9 +67,10 @@ EOF
 
 # Defaults
 DEFAULT_LOCALE_DIRS="/usr/share/locale:/usr/local/share/locale:/usr/share/locale-langpack:/usr/lib/locale:/Library/Locale:/System/Library/Frameworks/Python.framework/Versions/Current/Resources/locale"
-STRATEGY="quick"
+STRATEGY="auto"
+STRATEGY_SET=0
 LOCALE_DIRS="${LOCALE_DIRS:-$DEFAULT_LOCALE_DIRS}"
-CACHE_MODE="none" # read | write | none
+CACHE_MODE="read" # read | write | none; auto mode overrides as needed
 CACHE_MODE_SET=0 # becomes 1 if user explicitly passed --cache-mode
 REFRESH=0
 DEBUG=0
@@ -78,6 +83,7 @@ CACHE_STATS=0
 TTL=3600
 ROOTS=""
 LANGS=""
+CACHE_INIT=0
 
 # Print missing-argument error and show usage
 _missing_arg() { echo "error: missing value for $1" >&2; usage; }
@@ -95,7 +101,7 @@ _getval() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --roots)      ROOTS="$(_getval --roots "${2-}")"; shift 2 ;;
-    --strategy)   STRATEGY="$(_getval --strategy "${2-}")"; shift 2 ;;
+    --strategy)   STRATEGY="$(_getval --strategy "${2-}")"; STRATEGY_SET=1; shift 2 ;;
     --cache-mode) CACHE_MODE="$(_getval --cache-mode "${2-}")"; CACHE_MODE_SET=1; shift 2 ;;
     --refresh)    REFRESH=1; shift ;;
     --ttl)        TTL="$(_getval --ttl "${2-}")"; shift 2 ;;
@@ -109,6 +115,7 @@ while [ $# -gt 0 ]; do
     --cache-stats) CACHE_STATS=1; shift ;;
     --version)    printf '%s\n' "$VERSION"; exit 0 ;;
     --dry-run)    OUTPUT_MODE="filename"; shift ;;
+    --cache-init) CACHE_INIT=1; shift ;;
     -h|--help)    usage ;;
     --) shift; break ;;
     -*)
@@ -183,7 +190,33 @@ case "$OS" in
   Darwin*) DEFAULT_XDG="$HOME/Library/Caches" ;;
   *)       DEFAULT_XDG="$HOME/.cache" ;;
 esac
+XDG_CACHE_HOME_USER_SET=0
+if [ -n "${XDG_CACHE_HOME:-}" ]; then
+  XDG_CACHE_HOME_USER_SET=1
+fi
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DEFAULT_XDG}"
+
+# Respect XDG_DATA_HOME for user-local data (common place for per-user locale files).
+# Default per-spec: ${XDG_DATA_HOME:-$HOME/.local/share}
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+# Ensure LOCALE_DIRS includes $XDG_DATA_HOME/locale so per-user installs are discovered.
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+  case ":${LOCALE_DIRS:-}:" in
+    *":${XDG_DATA_HOME}/locale:") ;;
+    *) LOCALE_DIRS="${LOCALE_DIRS}:${XDG_DATA_HOME}/locale" ;;
+  esac
+fi
+
+_human_size() {
+  local bytes="$1"
+  awk -v b="${bytes}" 'BEGIN {
+    split("B KiB MiB GiB TiB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]
+    else printf "%.1f %s", b, u[i]
+  }'
+}
 
 # Track explicit cache path overrides supplied by the environment.
 CACHE_FILE_EXPLICIT=0
@@ -196,17 +229,25 @@ CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME}/random-translation}"
 CACHE_FILE="${CACHE_FILE:-${CACHE_DIR}/mos.cache}"
 
 # Resolve cache file from multiple canonical locations (respect explicit overrides)
+preferred_cache=""
 if [ "$CACHE_FILE_EXPLICIT" -eq 1 ]; then
-  : # explicit CACHE_FILE is authoritative (exists or not)
+  preferred_cache="$CACHE_FILE"
 elif [ "$CACHE_DIR_EXPLICIT" -eq 1 ]; then
-  CACHE_FILE="${CACHE_DIR}/mos.cache"
+  preferred_cache="${CACHE_DIR}/mos.cache"
+elif [ "$XDG_CACHE_HOME_USER_SET" -eq 1 ]; then
+  CACHE_DIR="${XDG_CACHE_HOME}/random-translation"
+  preferred_cache="${CACHE_DIR}/mos.cache"
 elif [ -n "${CACHE_FILE:-}" ] && [ -f "${CACHE_FILE}" ]; then
-  : # discovered default exists; keep it
+  preferred_cache="$CACHE_FILE"
+fi
+
+if [ -n "$preferred_cache" ]; then
+  CACHE_FILE="$preferred_cache"
 else
   candidates=(
     "${CACHE_FILE:-}"
     "${CACHE_DIR:-}/mos.cache"
-    "${XDG_CACHE_HOME:-$HOME/.cache}/random-translation/mos.cache"
+    "${XDG_CACHE_HOME:-$DEFAULT_XDG}/random-translation/mos.cache"
     "$HOME/Library/Caches/random-translation/mos.cache"
     "$HOME/.cache/random-translation/mos.cache"
     "/var/cache/random-translation/mos.cache"
@@ -221,12 +262,11 @@ else
     fi
   done
 
-  # If none exist, pick preferred writable location for future writes
   if [ -z "$CACHE_FILE" ]; then
     if [ "$OS" = "Darwin" ]; then
       CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/Library/Caches}/random-translation}"
     else
-      CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/random-translation}"
+      CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$DEFAULT_XDG}/random-translation}"
     fi
     CACHE_FILE="${CACHE_FILE:-$CACHE_DIR/mos.cache}"
     mkdir -p "$CACHE_DIR" 2>/dev/null || true
@@ -284,30 +324,96 @@ _print_cache_missing() {
   echo "  ./random-translation --strategy deep --cache-mode write --refresh LANG" >&2
 }
 
+# _print_cache_stats: Display cache metrics with maximal portability
+#
+# Portability guarantees:
+#   - Works on GNU/Linux, BSD (FreeBSD/OpenBSD/NetBSD), macOS, WSL, minimal containers
+#   - Graceful degradation when utilities are missing (du, stat, awk, etc.)
+#   - POSIX sh compliant except for local variables (required for recursion safety)
+#   - Handles both GNU and BSD stat/du flag differences automatically
+#   - No bashisms in critical paths (arrays $() safe, no [[ ]], no <<<)
+#
+# Size terminology:
+#   - "Logical size" = byte count of file contents (what wc -c reports)
+#   - "Physical size" = actual disk blocks allocated (includes metadata, slack space)
+#
+# Units: IEC binary (KiB, MiB, GiB) for precision — 1 KiB = 1024 bytes
 _print_cache_stats() {
-  local count now mtime age idx_files=0 idx_total=0 f c
+  local count now mtime age idx_files=0 idx_total=0 f c size_bytes size_human
+  local dir_logical_bytes dir_logical_human dir_physical_bytes dir_physical_human
+
   [ -f "${CACHE_FILE:-}" ] || return 1
+
   mtime=$(_mtime_epoch "${CACHE_FILE}")
   now=$(date +%s)
   age=$((now - mtime))
   count=$(wc -l <"${CACHE_FILE}" 2>/dev/null || echo 0)
-  printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\n' "${CACHE_FILE}" "$count" "$age"
+
+  size_bytes=$(wc -c <"${CACHE_FILE}" 2>/dev/null | tr -d ' ' || echo 0)
+  size_human=$(_human_size "$size_bytes")
+
+  dir_logical_bytes=0
+  dir_physical_bytes=""
+
+  if command -v du >/dev/null 2>&1; then
+    # Logical size: apparent bytes (GNU -b, BSD -A)
+    dir_logical_bytes=$(du -sb "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+    if [ -z "$dir_logical_bytes" ]; then
+      # BSD/macOS: -A = apparent size, multiply 1K blocks by 1024
+      dir_logical_bytes=$(du -sAk "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+      dir_logical_bytes=$((dir_logical_bytes * 1024))
+    fi
+
+    # Physical size: disk blocks allocated (GNU --block-size=1, BSD -k)
+    dir_physical_bytes=$(du -s --block-size=1 "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+    if [ -z "$dir_physical_bytes" ]; then
+      # BSD/macOS: -k gives 1024-byte blocks
+      dir_physical_bytes=$(du -sk "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+      dir_physical_bytes=$((dir_physical_bytes * 1024))
+    fi
+  else
+    # Fallback: manual logical sum; physical unavailable without du
+    while IFS= read -r -d '' f; do
+      local sz
+      sz=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
+      dir_logical_bytes=$((dir_logical_bytes + sz))
+    done < <(find "${CACHE_DIR}" -type f -print0 2>/dev/null)
+  fi
+
+  dir_logical_human=$(_human_size "$dir_logical_bytes")
+
+  if [ -n "$dir_physical_bytes" ]; then
+    dir_physical_human=$(_human_size "$dir_physical_bytes")
+  else
+    dir_physical_bytes="N/A"
+    dir_physical_human="N/A"
+  fi
+
+  printf 'Cache file: %s
+Entries: %s
+Age seconds: %s
+Cache file size: %s (%s bytes)
+Cache directory (logical): %s (%s bytes)
+Disk usage: %s (%s bytes)
+'     "${CACHE_FILE}" "$count" "$age" "$size_human" "$size_bytes" \
+      "$dir_logical_human" "$dir_logical_bytes" \
+      "$dir_physical_human" "$dir_physical_bytes"
+
   for f in "${CACHE_DIR}"/mos.cache.lang.*; do
     [ -f "$f" ] || continue
     case "$f" in
       *.count)
         c=$(tr -d '[:space:]' <"$f" 2>/dev/null || echo 0)
-        case "$c" in
-          ''|*[!0-9]*) c=0 ;;
-        esac
+        case "$c" in ''|*[!0-9]*) c=0 ;; esac
         idx_total=$((idx_total + c))
         ;;
-      *)
-        [ -s "$f" ] && idx_files=$((idx_files + 1))
-        ;;
+      *) [ -s "$f" ] && idx_files=$((idx_files + 1)) ;;
     esac
   done
-  printf 'Language indexes: %s\nIndexed entries: %s\n' "$idx_files" "$idx_total"
+
+  printf 'Language indexes: %s
+Indexed entries: %s
+' "$idx_files" "$idx_total"
 }
 
 # Debug trace of chosen cache
@@ -321,8 +427,10 @@ if [ "${CACHE_STATS:-0}" -eq 1 ]; then
   if _print_cache_stats; then
     exit 0
   else
-    _print_cache_missing "--cache-stats"
-    exit 3
+    echo "No cache found yet at: ${CACHE_FILE:-}" >&2
+    echo "Run once with languages to auto-build it, for example:" >&2
+    echo "  random-translation sv,fi,pl" >&2
+    exit 0
   fi
 fi
 
@@ -345,12 +453,62 @@ LANGS=$(printf '%s\n' "$LANGS" | awk 'BEGIN{ORS=" "} {gsub(/,/," "); for(i=1;i<=
 
 # Only require LANGS when the user actually needs to select translations.
 # Allow --cache-stats and --strategy cached to run without LANGS.
-if [ -z "$LANGS" ] && [ "${CACHE_STATS:-0}" -eq 0 ] && [ "${STRATEGY:-}" != "cached" ]; then
-  echo "error: no language specified. Provide one or more language codes as arguments." >&2
-  usage
+if [ -z "$LANGS" ] && [ "${CACHE_STATS:-0}" -eq 0 ] && [ "${STRATEGY:-}" != "cached" ] && [ "${CACHE_INIT:-0}" -eq 0 ]; then
+  echo "Please specify one or more languages." >&2
+  echo "Use --help for usage instructions." >&2
+  exit 1
 fi
 
-# Validate targeted strategy usage: require --roots when using targeted
+if [ "${CACHE_INIT:-0}" -eq 1 ]; then
+  if [ "${STRATEGY_SET:-0}" -eq 1 ] || [ "${CACHE_MODE_SET:-0}" -eq 1 ]; then
+    echo "error: --cache-init cannot be combined with --strategy or --cache-mode" >&2
+    exit 1
+  fi
+  STRATEGY="deep"
+  CACHE_MODE="write"
+  STRATEGY_SET=1
+  CACHE_MODE_SET=1
+  REFRESH=1
+fi
+
+# Resolve default interface:
+#   - no explicit strategy/cache-mode => auto mode (deep build first, cached thereafter)
+#   - explicit strategy without cache-mode keeps old behavior: cached -> read, others -> none
+#   - explicit cache-mode without strategy picks a sensible companion strategy
+if [ "${STRATEGY_SET:-0}" -eq 0 ] && [ "${CACHE_MODE_SET:-0}" -eq 1 ]; then
+  case "$CACHE_MODE" in
+    read)  STRATEGY="cached" ;;
+    write) STRATEGY="deep" ;;
+    none)  STRATEGY="quick" ;;
+  esac
+fi
+
+if [ "${STRATEGY_SET:-0}" -eq 1 ] && [ "${CACHE_MODE_SET:-0}" -eq 0 ]; then
+  case "$STRATEGY" in
+    cached) CACHE_MODE="read" ;;
+    auto) ;;
+    *) CACHE_MODE="none" ;;
+  esac
+fi
+
+if [ "${STRATEGY:-}" = "auto" ]; then
+  if [ "${CACHE_MODE_SET:-0}" -eq 1 ]; then
+    echo "error: --strategy auto does not accept an explicit --cache-mode" >&2
+    echo "Hint: omit --cache-mode for automatic behavior, or choose a manual strategy." >&2
+    exit 1
+  fi
+  if [ "${REFRESH:-0}" -eq 1 ] || [ ! -f "${CACHE_FILE:-}" ]; then
+    STRATEGY="deep"
+    CACHE_MODE="write"
+    [ "${DEBUG:-0}" -eq 1 ] && echo "DEBUG: auto mode -> deep write" >&2
+  else
+    STRATEGY="cached"
+    CACHE_MODE="read"
+    [ "${DEBUG:-0}" -eq 1 ] && echo "DEBUG: auto mode -> cached read" >&2
+  fi
+fi
+
+# Validate strategy-specific options
 if [ "${STRATEGY:-}" = "targeted" ] && [ -z "${ROOTS:-}" ]; then
   echo "error: --strategy targeted requires --roots to be set (colon-separated list of directories)." >&2
   echo >&2
@@ -359,15 +517,8 @@ if [ "${STRATEGY:-}" = "targeted" ] && [ -z "${ROOTS:-}" ]; then
   exit 1
 fi
 
-# If strategy is cached and user didn't explicitly set cache-mode, imply read-only cache
-if [ "${STRATEGY:-}" = "cached" ] && [ "${CACHE_MODE_SET:-0}" -eq 0 ]; then
-  # Note: --strategy cached implies --cache-mode read; proceeding in read-only cache mode
-  CACHE_MODE="read"
-fi
-
-# Cached strategy is read-only and cannot rebuild.
 if [ "${STRATEGY:-}" = "cached" ]; then
-  if [ "${CACHE_MODE:-}" = "write" ] || [ "${CACHE_MODE:-}" = "none" ]; then
+  if [ "${CACHE_MODE:-}" != "read" ]; then
     echo "error: --strategy cached only supports --cache-mode read" >&2
     echo "Hint: use --strategy indexed|deep with --cache-mode write to rebuild cache." >&2
     exit 1
@@ -379,11 +530,19 @@ if [ "${STRATEGY:-}" = "cached" ]; then
   fi
 fi
 
-# Validate CACHE_MODE and OUTPUT_MODE
+# Validate CACHE_MODE, STRATEGY, and OUTPUT_MODE
 case "$CACHE_MODE" in
   read|write|none) ;;
   *)
     echo "error: invalid --cache-mode value: $CACHE_MODE" >&2
+    usage
+    ;;
+esac
+
+case "$STRATEGY" in
+  auto|quick|indexed|targeted|deep|cached) ;;
+  *)
+    echo "error: invalid --strategy value: $STRATEGY" >&2
     usage
     ;;
 esac
@@ -643,15 +802,15 @@ if [ ! -s "${CACHE_FILE:-}" ]; then
     echo "or, for a full scan (slower):" >&2
     echo "  ./random-translation --strategy deep --cache-mode write --refresh LANG" >&2
     echo >&2
-    echo "Why: the default 'quick' strategy scans a small set of common locations and may miss" >&2
-    echo "system- or package-specific locale directories. Using 'indexed' (mdfind/locate) or" >&2
+    echo "Why: the cache is authoritative for fast runs, but cache rebuild strategy still matters when" >&2
+    echo "discovering translation files. Using 'indexed' (mdfind/locate) or" >&2
     echo "'deep' (full scan) and writing the results to the cache ensures subsequent runs are fast." >&2
   else
-    # cache-mode none (transient discovery) — explain quick strategy limitation and suggest building a cache
+    # cache-mode none (transient discovery) — explain explicit no-cache discovery and suggest building a cache
     echo >&2
     echo "No .mo files found." >&2
     echo >&2
-    echo "Note: the default 'quick' discovery strategy performs a shallow scan and may not find" >&2
+    echo "Note: explicit no-cache mode defaults to the 'quick' discovery strategy, which may not find" >&2
     echo "installed .mo files on some systems. To build a persistent cache that covers more locations," >&2
     echo "run one of the following (replace LANG with your language codes):" >&2
     echo "  ./random-translation --strategy indexed --cache-mode write --refresh LANG" >&2
@@ -660,6 +819,11 @@ if [ ! -s "${CACHE_FILE:-}" ]; then
     echo "After building the cache you can run without --refresh for faster selection." >&2
   fi
   exit 3
+fi
+
+if [ "${CACHE_INIT:-0}" -eq 1 ]; then
+  _print_cache_stats
+  exit 0
 fi
 
 # Normalise requested languages
