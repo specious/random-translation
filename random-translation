@@ -28,7 +28,7 @@ set -euo pipefail
 # Restore default SIGPIPE handling so the script exits when a downstream consumer closes the pipe
 trap - PIPE 2>/dev/null || true
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 usage() {
   cat <<'EOF'
@@ -45,6 +45,7 @@ Usage: random-translation [options] LANGS...
 
 Options
   --roots PATHS       Colon-separated roots to search (overrides default roots)
+  --filter PATHS      Colon-separated prefix paths to restrict discovery (overrides LOCALE_DIRS and enables filtering)
   --strategy STR      Discovery strategy: auto|quick|indexed|targeted|deep|cached
   --cache-mode MODE   Cache behavior: read|write|none
   --refresh           Force rebuild of the .mo list (applies when cache-mode is write or when using transient cache)
@@ -82,6 +83,7 @@ OUTPUT_MODE="normal" # normal | json | yaml | filename
 CACHE_STATS=0
 TTL=3600
 ROOTS=""
+FILTER_PATTERNS=""
 LANGS=""
 CACHE_INIT=0
 
@@ -113,6 +115,7 @@ while [ $# -gt 0 ]; do
     -n)           N_STRINGS="$(_getval -n "${2-}")"; shift 2 ;;
     --output)     OUTPUT_MODE="$(_getval --output "${2-}")"; shift 2 ;;
     --cache-stats) CACHE_STATS=1; shift ;;
+    --filter)     FILTER_PATTERNS="$(_getval --filter "${2-}")"; shift 2 ;;
     --version)    printf '%s\n' "$VERSION"; exit 0 ;;
     --dry-run)    OUTPUT_MODE="filename"; shift ;;
     --cache-init) CACHE_INIT=1; shift ;;
@@ -327,78 +330,134 @@ _print_cache_missing() {
 # _print_cache_stats: Display cache metrics with maximal portability
 #
 # Portability guarantees:
-#   - Works on GNU/Linux, BSD (FreeBSD/OpenBSD/NetBSD), macOS, WSL, minimal containers
+#   - Works on GNU/Linux, BSD (FreeBSD/OpenBSD/NetBSD), macOS/Darwin, WSL, Termux,
+#     minimal containers, and any POSIX-ish environment with bash
 #   - Graceful degradation when utilities are missing (du, stat, awk, etc.)
-#   - POSIX sh compliant except for local variables (required for recursion safety)
-#   - Handles both GNU and BSD stat/du flag differences automatically
-#   - No bashisms in critical paths (arrays $() safe, no [[ ]], no <<<)
+#   - Handles GNU vs BSD tool flag differences automatically via feature detection
+#   - No external dependencies beyond core POSIX utilities + bash
 #
 # Size terminology:
-#   - "Logical size" = byte count of file contents (what wc -c reports)
+#   - "Logical size" = byte count of file contents (what ls -l or stat reports)
 #   - "Physical size" = actual disk blocks allocated (includes metadata, slack space)
 #
 # Units: IEC binary (KiB, MiB, GiB) for precision — 1 KiB = 1024 bytes
 _print_cache_stats() {
   local count now mtime age idx_files=0 idx_total=0 f c size_bytes size_human
   local dir_logical_bytes dir_logical_human dir_physical_bytes dir_physical_human
+  local has_gnu_du has_gnu_stat has_bsd_stat
 
   [ -f "${CACHE_FILE:-}" ] || return 1
 
+  # --- Basic metadata (portable everywhere) ---
   mtime=$(_mtime_epoch "${CACHE_FILE}")
   now=$(date +%s)
   age=$((now - mtime))
-  count=$(wc -l <"${CACHE_FILE}" 2>/dev/null || echo 0)
+  count=$(wc -l <"${CACHE_FILE}" 2>/dev/null | tr -d '[:space:]' || echo 0)
 
-  size_bytes=$(wc -c <"${CACHE_FILE}" 2>/dev/null | tr -d ' ' || echo 0)
+  size_bytes=$(wc -c <"${CACHE_FILE}" 2>/dev/null | tr -d '[:space:]' || echo 0)
   size_human=$(_human_size "$size_bytes")
 
-  dir_logical_bytes=0
+  dir_logical_bytes=""
   dir_physical_bytes=""
 
+  # --- Detect tool capabilities ---
+  # GNU du can be identified by --version output (BSD du doesn't have this)
+  has_gnu_du=0
   if command -v du >/dev/null 2>&1; then
-    # Logical size: apparent bytes (GNU -b, BSD -A)
-    dir_logical_bytes=$(du -sb "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
-    if [ -z "$dir_logical_bytes" ]; then
-      # BSD/macOS: -A = apparent size, multiply 1K blocks by 1024
-      dir_logical_bytes=$(du -sAk "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
-      dir_logical_bytes=$((dir_logical_bytes * 1024))
+    if du --version 2>/dev/null | grep -q 'GNU coreutils'; then
+      has_gnu_du=1
     fi
+  fi
 
-    # Physical size: disk blocks allocated (GNU --block-size=1, BSD -k)
+  # Stat detection
+  has_gnu_stat=0
+  has_bsd_stat=0
+  if command -v stat >/dev/null 2>&1; then
+    if stat -c %s "${CACHE_FILE}" >/dev/null 2>&1; then
+      has_gnu_stat=1
+    elif stat -f %z "${CACHE_FILE}" >/dev/null 2>&1; then
+      has_bsd_stat=1
+    fi
+  fi
+
+  # --- Calculate logical size (apparent bytes) ---
+  # Only GNU du -b gives reliable logical bytes. BSD du -A is inconsistent
+  # across versions (macOS ignores it, FreeBSD uses it, OpenBSD uses 512-blocks),
+  # so we use stat summation for all non-GNU systems.
+
+  if [ "$has_gnu_du" -eq 1 ]; then
+    # GNU: -b gives logical bytes directly
+    dir_logical_bytes=$(du -sb "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+  fi
+
+  # For non-GNU systems (macOS, BSD, etc.), use stat summation
+  if [ -z "$dir_logical_bytes" ] || [ "$dir_logical_bytes" = "0" ]; then
+    if [ "$has_bsd_stat" -eq 1 ] || [ "$has_gnu_stat" -eq 1 ]; then
+      dir_logical_bytes=0
+      while IFS= read -r -d '' f; do
+        local sz=0
+        if [ "$has_bsd_stat" -eq 1 ]; then
+          sz=$(stat -f %z "$f" 2>/dev/null || echo 0)
+        else
+          sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        fi
+        # Validate numeric
+        case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+        dir_logical_bytes=$((dir_logical_bytes + sz))
+      done < <(find "${CACHE_DIR}" -type f -print0 2>/dev/null)
+    fi
+  fi
+
+  # Final fallback
+  if [ -z "$dir_logical_bytes" ] || [ "$dir_logical_bytes" = "0" ]; then
+    dir_logical_bytes=$size_bytes
+  fi
+
+  # --- Calculate physical size (disk blocks) ---
+  if [ "$has_gnu_du" -eq 1 ]; then
+    # GNU: --block-size=1 gives bytes
     dir_physical_bytes=$(du -s --block-size=1 "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
-    if [ -z "$dir_physical_bytes" ]; then
-      # BSD/macOS: -k gives 1024-byte blocks
-      dir_physical_bytes=$(du -sk "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+  elif command -v du >/dev/null 2>&1; then
+    # BSD/macOS: -sk gives 1024-byte blocks (physical)
+    dir_physical_bytes=$(du -sk "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
+    if [ -n "$dir_physical_bytes" ]; then
       dir_physical_bytes=$((dir_physical_bytes * 1024))
     fi
-  else
-    # Fallback: manual logical sum; physical unavailable without du
-    while IFS= read -r -d '' f; do
-      local sz
-      sz=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
-      dir_logical_bytes=$((dir_logical_bytes + sz))
-    done < <(find "${CACHE_DIR}" -type f -print0 2>/dev/null)
   fi
 
+  # Fallback to stat blocks
+  if [ -z "$dir_physical_bytes" ] || [ "$dir_physical_bytes" = "0" ]; then
+    if [ "$has_bsd_stat" -eq 1 ] || [ "$has_gnu_stat" -eq 1 ]; then
+      dir_physical_bytes=0
+      while IFS= read -r -d '' f; do
+        local blocks=0
+        if [ "$has_bsd_stat" -eq 1 ]; then
+          blocks=$(stat -f %b "$f" 2>/dev/null || echo 0)
+        else
+          blocks=$(stat -c %b "$f" 2>/dev/null || echo 0)
+        fi
+        case "$blocks" in ''|*[!0-9]*) blocks=0 ;; esac
+        dir_physical_bytes=$((dir_physical_bytes + blocks * 512))
+      done < <(find "${CACHE_DIR}" -type f -print0 2>/dev/null)
+    fi
+  fi
+
+  # --- Format output ---
   dir_logical_human=$(_human_size "$dir_logical_bytes")
 
-  if [ -n "$dir_physical_bytes" ]; then
+  if [ -n "$dir_physical_bytes" ] && [ "$dir_physical_bytes" != "0" ]; then
     dir_physical_human=$(_human_size "$dir_physical_bytes")
   else
-    dir_physical_bytes="N/A"
     dir_physical_human="N/A"
+    dir_physical_bytes="N/A"
   fi
 
-  printf 'Cache file: %s
-Entries: %s
-Age seconds: %s
-Cache file size: %s (%s bytes)
-Cache directory (logical): %s (%s bytes)
-Disk usage: %s (%s bytes)
-'     "${CACHE_FILE}" "$count" "$age" "$size_human" "$size_bytes" \
-      "$dir_logical_human" "$dir_logical_bytes" \
-      "$dir_physical_human" "$dir_physical_bytes"
+  printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\nCache file size: %s (%s bytes)\nCache directory (logical): %s (%s bytes)\nDisk usage: %s (%s bytes)\n' \
+    "${CACHE_FILE}" "$count" "$age" "$size_human" "$size_bytes" \
+    "$dir_logical_human" "$dir_logical_bytes" \
+    "$dir_physical_human" "$dir_physical_bytes"
 
+  # --- Language index stats ---
   for f in "${CACHE_DIR}"/mos.cache.lang.*; do
     [ -f "$f" ] || continue
     case "$f" in
@@ -411,9 +470,7 @@ Disk usage: %s (%s bytes)
     esac
   done
 
-  printf 'Language indexes: %s
-Indexed entries: %s
-' "$idx_files" "$idx_total"
+  printf 'Language indexes: %s\nIndexed entries: %s\n' "$idx_files" "$idx_total"
 }
 
 # Debug trace of chosen cache
@@ -427,7 +484,7 @@ if [ "${CACHE_STATS:-0}" -eq 1 ]; then
   if _print_cache_stats; then
     exit 0
   else
-    echo "No cache found yet at: ${CACHE_FILE:-}" >&2
+    echo "No cache found at: ${CACHE_FILE:-}" >&2
     echo "Run once with languages to auto-build it, for example:" >&2
     echo "  random-translation sv,fi,pl" >&2
     exit 0
@@ -576,6 +633,17 @@ if [ -n "$ROOTS" ]; then
   done
 fi
 
+# Enable filtering only when requested explicitly. By default deep scans are
+# unrestricted which avoids accidentally omitting system-wide locations when
+# performing a full deep scan. If --filter is provided it overrides the
+# locale-dir filter list.
+if [ -n "$ROOTS" ] || [ -n "${FILTER_PATTERNS:-}" ]; then
+  SKIP_LOCALE_FILTER=0
+  if [ -n "${FILTER_PATTERNS:-}" ]; then
+    LOCALE_DIRS="$FILTER_PATTERNS"
+  fi
+fi
+
 # Discovery dispatcher with debug messages
 discover_mo_list() {
   local strategy="$1"; local cache="$2"; local debug="$3"; local roots="$4"
@@ -645,7 +713,10 @@ discover_mo_list() {
 
 # Compact, correct cache-mode logic
 rebuild_cache=0
-SKIP_LOCALE_FILTER=0   # when cache-mode=none we will skip LOCALE_DIRS filtering
+# Default: do not filter results by LOCALE_DIRS unless the user explicitly
+# requests filtering via --roots or --filter. When SKIP_LOCALE_FILTER=1 the
+# locale-dir prefix filter is disabled and deep scans are unrestricted.
+SKIP_LOCALE_FILTER=1
 
 case "$CACHE_MODE" in
   none)

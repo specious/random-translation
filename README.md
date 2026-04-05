@@ -38,6 +38,7 @@ and works on macOS, Linux, and other Unix-like systems.
 - **Debugging:** `--debug` shows discovery and cache decisions
 - **Modern XDG support:** honors `XDG_CACHE_HOME` (cache location) and `XDG_DATA_HOME/locale`
   (per-user locale data) when present; defaults to sensible platform locations otherwise
+- **Filtering:** opt-in `--filter` to restrict discovery to prefix paths (see "Filtering and deep scans")
 
 ## Install
 
@@ -62,6 +63,43 @@ is placed under `$XDG_CACHE_HOME/random-translation` (or `~/.cache/random-transl
 per-user locale data directories under `$XDG_DATA_HOME/locale` (or `~/.local/share/locale`)
 are included in discovery. On macOS the cache defaults to `~/Library/Caches` when XDG
 variables are not set.
+
+### Filtering and deep scans
+
+By default the `deep` discovery strategy performs an unrestricted scan of the filesystem
+and does not implicitly restrict results to a small set of prefix roots. This avoids
+accidentally omitting translations that live outside common system directories.
+
+If you want to restrict discovery to a set of trusted locations, you can:
+
+- Use `--roots` (colon-separated) to add those roots to the built-in locale roots and
+  enable prefix filtering.
+- Use `--filter` (colon-separated) to set an explicit list of prefix paths to filter
+  discovered .mo files against. `--filter` overrides the internal LOCALE_DIRS used for
+  filtering and is useful for advanced control.
+
+Examples:
+
+```
+# Unrestricted deep scan (default behaviour for --strategy deep):
+random-translation --strategy deep --cache-mode write sv,fi,pl
+
+# Restrict discovery to two locations (enable filtering):
+random-translation --strategy deep --cache-mode write --roots "/usr/share/locale:/opt/myapp/share/locale" el
+
+# Explicit filter list that overrides internal LOCALE_DIRS:
+random-translation --strategy deep --cache-mode write --filter "/opt/myapp/locale:/home/user/.local/share/locale" fr
+```
+
+Why restrict discovery? Reasons advanced users might want to:
+
+- Limit runtime and I/O during a deep scan on systems with very large filesystems.
+- Ensure only specific application or vendor locale directories are considered.
+- Avoid picking translations from transient mount points or network shares.
+- Reproduce a narrow, deterministic dataset for testing.
+
+Note: Filtering is opt-in. If you previously relied on `--cache-mode none` to avoid
+filtering side-effects, the default deep scan now behaves the same (unrestricted).
 
 ```bash
 # First run: deep scan + cache build
@@ -208,6 +246,8 @@ phosphor --scale 4 --delay 80000 --pipe --program '/usr/local/bin/random-transla
 - Or force a rebuild: `random-translation --strategy deep --cache-mode write --refresh LANG`
 - Use `--roots` with `--strategy targeted` to point at known locale directories
 - Use `--debug` to inspect discovery and cache decisions
+- If translations are unexpectedly missing, check whether `--roots` or `--filter` were used
+  (these enable prefix filtering), and verify XDG variables (`XDG_DATA_HOME`, `XDG_CACHE_HOME`).
 
 **`xcrun: error: cannot be used within an App Sandbox`**
 
@@ -239,6 +279,7 @@ Usage: random-translation [options] LANGS...
 
 Options
   --roots PATHS       Colon-separated roots to search (overrides default roots)
+  --filter PATHS      Colon-separated prefix paths to restrict discovery (overrides default LOCALE_DIRS and enables filtering)
   --strategy STR      Discovery strategy: auto|quick|indexed|targeted|deep|cached
   --cache-mode MODE   Cache behavior: read|write|none
   --refresh           Force rebuild of the .mo list (applies when cache-mode is write or when using transient cache)
