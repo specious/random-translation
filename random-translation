@@ -28,7 +28,7 @@ set -euo pipefail
 # Restore default SIGPIPE handling so the script exits when a downstream consumer closes the pipe
 trap - PIPE 2>/dev/null || true
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 usage() {
   cat <<'EOF'
@@ -218,6 +218,17 @@ _human_size() {
     while (b >= 1024 && i < 5) { b /= 1024; i++ }
     if (i == 1) printf "%d %s", b, u[i]
     else printf "%.1f %s", b, u[i]
+  }'
+}
+
+_human_age() {
+  local secs="$1"
+  awk -v s="${secs}" 'BEGIN {
+    if (s < 0) s = 0
+    if (s < 60) { printf "%d second%s", s, (s==1?"":"s") }
+    else if (s < 3600) { m = int(s/60); printf "%d minute%s", m, (m==1?"":"s") }
+    else if (s < 86400) { h = int(s/3600); printf "%d hour%s", h, (h==1?"":"s") }
+    else { d = int(s/86400); printf "%d day%s", d, (d==1?"":"s") }
   }'
 }
 
@@ -452,8 +463,10 @@ _print_cache_stats() {
     dir_physical_bytes="N/A"
   fi
 
-  printf 'Cache file: %s\nEntries: %s\nAge seconds: %s\nCache file size: %s (%s bytes)\nCache directory (logical): %s (%s bytes)\nDisk usage: %s (%s bytes)\n' \
-    "${CACHE_FILE}" "$count" "$age" "$size_human" "$size_bytes" \
+  age_human=$(_human_age "$age")
+
+  printf 'Cache file: %s\nEntries: %s\nAge: %s\nCache file size: %s (%s bytes)\nCache directory (logical): %s (%s bytes)\nDisk usage: %s (%s bytes)\n' \
+    "${CACHE_FILE}" "$count" "$age_human" "$size_human" "$size_bytes" \
     "$dir_logical_human" "$dir_logical_bytes" \
     "$dir_physical_human" "$dir_physical_bytes"
 
