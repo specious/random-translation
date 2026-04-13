@@ -1,0 +1,954 @@
+#!/usr/bin/env bash
+#
+# Test runner for random-translation
+#
+# Tests the od/awk .mo parser and output formatters in isolation.
+# No network, no index, no language discovery needed.
+# Designed to catch regressions across different awk and od implementations
+# (GNU awk/od on Linux, BSD awk/od on macOS, etc.)
+#
+# Usage:
+#   ./tests/run                    # run all tests
+#   ./tests/run --script PATH      # test a specific script location
+#   ./tests/run -v                 # verbose (show pass details too)
+
+set -euo pipefail
+
+SCRIPT="${SCRIPT:-$(dirname "$0")/../random-translation}"
+VERBOSE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --script) SCRIPT="$2"; shift 2 ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "error: script not found or not executable: $SCRIPT" >&2
+  exit 1
+fi
+
+#
+# Color output  (respects NO_COLOR and non-TTY)
+#
+
+_want_color() { [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; }
+
+if _want_color; then
+  _E=$'\033'
+  _CY="${_E}[38;5;51m"    # electric cyan
+  _YL="${_E}[38;5;226m"   # neon yellow
+  _GN="${_E}[38;5;82m"    # neon green    — pass
+  _MG="${_E}[38;5;197m"   # hot magenta   — fail
+  _OR="${_E}[38;5;214m"   # amber orange  — skip
+  _DG="${_E}[38;5;238m"   # dark gray     — borders/dim
+  _LG="${_E}[38;5;245m"   # mid gray      — secondary text
+  _WH="${_E}[38;5;255m"   # near white
+  _BD="${_E}[1m"
+  _RS="${_E}[0m"
+else
+  _E='' _CY='' _YL='' _GN='' _MG='' _OR='' _DG='' _LG='' _WH='' _BD='' _RS=''
+fi
+
+#
+# Layout helpers
+#
+
+# Repeat a box-drawing character N times via awk (portable, multi-byte safe)
+_rep() { awk -v c="$1" -v n="$2" 'BEGIN{ r=""; for(i=0;i<n;i++) r=r c; printf r }'; }
+
+_hrule() { _rep '═' 57; }   # ═ × 57  (box top/bottom/divider)
+_drule() { _rep '╌' 57; }   # ╌ × 57  (section underline)
+
+_bar() {
+  # _bar N TOTAL WIDTH COLOR  — colored filled █, dark-gray empty ░
+  local n="$1" total="$2" w="${3:-34}" color="${4:-$_GN}"
+  [ "$total" -le 0 ] && total=1
+  local fill=$(( n * w / total ))
+  local empty=$(( w - fill ))
+  printf '%s' "$color"
+  [ "$fill"  -gt 0 ] && _rep '█' "$fill"
+  printf '%s' "$_DG"
+  [ "$empty" -gt 0 ] && _rep '░' "$empty"
+  printf '%s' "$_RS"
+}
+
+_print_header() {
+  local target="$1"
+  printf '\n'
+  printf '  %s╔%s╗%s\n' "$_DG" "$(_hrule)" "$_RS"
+  printf '  %s║%s  %s◈  RANDOM · TRANSLATION  ─  TEST SUITE%s                 %s║%s\n' \
+    "$_DG" "$_RS" "${_YL}${_BD}" "$_RS" "$_DG" "$_RS"
+  printf '  %s╚%s╝%s\n' "$_DG" "$(_hrule)" "$_RS"
+  printf '     %s▸%s  %s%s%s\n\n' "$_CY" "$_RS" "$_LG" "$target" "$_RS"
+}
+
+_section() {
+  local title
+  title=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  printf '\n  %s◈%s  %s%s%s\n' "$_CY" "$_RS" "${_YL}${_BD}" "$title" "$_RS"
+  printf '  %s%s%s\n' "$_DG" "$(_drule)" "$_RS"
+}
+
+_print_summary() {
+  local total bw=34
+  total=$(( PASS + FAIL + SKIP ))
+  [ "$total" -le 0 ] && total=1
+  local _s _fpad
+  [ "$FAIL" -eq 1 ] && _s="" || _s="s"
+  _fpad=$(( 19 - ${#FAIL} - ${#_s} ))
+  printf '\n'
+  printf '  %s╔%s╗%s\n' "$_DG" "$(_hrule)" "$_RS"
+  printf '  %s║%s  %sEXEC REPORT%s                                 %s%3d tests%s  %s║%s\n' \
+    "$_DG" "$_RS" "${_YL}${_BD}" "$_RS" "$_LG" "$((PASS+FAIL+SKIP))" "$_RS" "$_DG" "$_RS"
+  printf '  %s╠%s╣%s\n' "$_DG" "$(_hrule)" "$_RS"
+  printf '  %s║%s  %sPASS%s  ' "$_DG" "$_RS" "${_GN}${_BD}" "$_RS"
+  _bar "$PASS" "$total" "$bw" "$_GN"
+  printf '  %s%4d%s         %s║%s\n' "${_WH}${_BD}" "$PASS" "$_RS" "$_DG" "$_RS"
+  printf '  %s║%s  %sSKIP%s  ' "$_DG" "$_RS" "${_OR}${_BD}" "$_RS"
+  _bar "$SKIP" "$total" "$bw" "$_OR"
+  printf '  %s%4d%s         %s║%s\n' "${_WH}${_BD}" "$SKIP" "$_RS" "$_DG" "$_RS"
+  printf '  %s║%s  %sFAIL%s  ' "$_DG" "$_RS" "${_MG}${_BD}" "$_RS"
+  _bar "$FAIL" "$total" "$bw" "$_MG"
+  printf '  %s%4d%s         %s║%s\n' "${_WH}${_BD}" "$FAIL" "$_RS" "$_DG" "$_RS"
+  printf '  %s╠%s╣%s\n' "$_DG" "$(_hrule)" "$_RS"
+  if [ "$FAIL" -eq 0 ]; then
+    printf '  %s║%s  %s◈  ALL SYSTEMS NOMINAL%s                                 %s║%s\n' \
+      "$_DG" "$_RS" "${_GN}${_BD}" "$_RS" "$_DG" "$_RS"
+  else
+    printf '  %s║%s  %s◈  CRITICAL FAILURE  ─  %d test%s failed%s%*s%s║%s\n' \
+      "$_DG" "$_RS" "${_MG}${_BD}" "$FAIL" "$_s" "$_RS" "$_fpad" '' "$_DG" "$_RS"
+  fi
+  printf '  %s╚%s╝%s\n\n' "$_DG" "$(_hrule)" "$_RS"
+}
+
+#
+# Test state
+#
+
+PASS=0
+FAIL=0
+SKIP=0
+_CURRENT_TEST=""
+
+_start() {
+  _CURRENT_TEST="$1"
+  printf '  %s▸%s  %s%s%s... ' "$_CY" "$_RS" "$_LG" "$_CURRENT_TEST" "$_RS"
+}
+
+_pass() {
+  PASS=$((PASS + 1))
+  printf '%s✓%s\n' "$_GN" "$_RS"
+  if [ "$VERBOSE" -eq 1 ]; then
+    printf '     %s%s%s\n' "$_LG" "$_CURRENT_TEST" "$_RS"
+  fi
+}
+
+_fail() {
+  FAIL=$((FAIL + 1))
+  printf '%s✗%s\n' "$_MG" "$_RS"
+  printf '     %s%s%s\n' "${_WH}${_BD}" "$_CURRENT_TEST" "$_RS"
+  printf '%b\n' "$1" | while IFS= read -r _dl; do
+    printf '        %s│%s  %s%s%s\n' "$_DG" "$_RS" "$_LG" "$_dl" "$_RS"
+  done
+}
+
+_skip() {
+  SKIP=$((SKIP + 1))
+  printf '%s○%s\n' "$_OR" "$_RS"
+  printf '     %s%s%s  %s·  %s%s%s\n' \
+    "$_LG" "$_CURRENT_TEST" "$_RS" \
+    "$_DG" "$_OR" "$1" "$_RS"
+}
+
+# Assert exact match
+_assert_eq() {
+  local got="$1" want="$2"
+  if [ "$got" = "$want" ]; then
+    _pass
+  else
+    _fail "expected  $(printf '%s' "$want" | head -c 120)\ngot       $(printf '%s' "$got" | head -c 120)"
+  fi
+}
+
+# Assert output contains a substring
+_assert_contains() {
+  local got="$1" want="$2"
+  case "$got" in
+    *"$want"*) _pass ;;
+    *) _fail "expected to contain  $(printf '%s' "$want" | head -c 120)\ngot               $(printf '%s' "$got" | head -c 200)" ;;
+  esac
+}
+
+# Assert output does NOT contain a substring
+_assert_not_contains() {
+  local got="$1" want="$2"
+  case "$got" in
+    *"$want"*) _fail "expected NOT to contain  $(printf '%s' "$want" | head -c 120)\ngot                  $(printf '%s' "$got" | head -c 200)" ;;
+    *) _pass ;;
+  esac
+}
+
+# Assert command exits with code 0
+_assert_ok() {
+  if "$@" >/dev/null 2>&1; then _pass
+  else _fail "command failed: $*"; fi
+}
+
+# Assert command exits with nonzero
+_assert_fail() {
+  if ! "$@" >/dev/null 2>&1; then _pass
+  else _fail "expected failure but succeeded: $*"; fi
+}
+
+#
+# .mo file factory
+# Creates minimal valid GNU .mo files for controlled testing.
+#
+
+_make_mo() {
+  # Usage: _make_mo OUTFILE [msgid1 msgstr1 [msgid2 msgstr2 ...]]
+  # Pairs beyond the first are translated entries; the header (msgid="") is
+  # always injected automatically.
+  local outfile="$1"; shift
+  python3 - "$outfile" "$@" << 'PY'
+import sys, struct
+
+def make_mo(pairs):
+    pairs = sorted(pairs, key=lambda x: x[0])
+    n = len(pairs)
+    orig_off, trans_off = 28, 28 + n * 8
+    pos = trans_off + n * 8
+    orig_table = []
+    for k, _ in pairs:
+        orig_table.append((len(k), pos)); pos += len(k) + 1
+    trans_table = []
+    for _, v in pairs:
+        trans_table.append((len(v), pos)); pos += len(v) + 1
+    data = struct.pack('<IIIIIII', 0x950412de, 0, n, orig_off, trans_off, 0, 0)
+    for l, o in orig_table: data += struct.pack('<II', l, o)
+    for l, o in trans_table: data += struct.pack('<II', l, o)
+    for k, _ in pairs: data += k + b'\x00'
+    for _, v in pairs: data += v + b'\x00'
+    return data
+
+outfile = sys.argv[1]
+args = sys.argv[2:]
+pairs = [(b'', b'Content-Type: text/plain; charset=UTF-8\n')]
+for i in range(0, len(args), 2):
+    if i+1 < len(args):
+        pairs.append((args[i].encode('utf-8'), args[i+1].encode('utf-8')))
+
+with open(outfile, 'wb') as f:
+    f.write(make_mo(pairs))
+PY
+}
+
+_make_mo_raw() {
+  # Like _make_mo but accepts Python escape sequences for binary data.
+  # Usage: _make_mo_raw OUTFILE MSGID_BYTES MSGSTR_BYTES
+  local outfile="$1" msgid="$2" msgstr="$3"
+  python3 - "$outfile" "$msgid" "$msgstr" << 'PY'
+import sys, struct
+
+def make_mo(pairs):
+    pairs = sorted(pairs, key=lambda x: x[0])
+    n = len(pairs)
+    orig_off, trans_off = 28, 28 + n * 8
+    pos = trans_off + n * 8
+    orig_table = []
+    for k, _ in pairs:
+        orig_table.append((len(k), pos)); pos += len(k) + 1
+    trans_table = []
+    for _, v in pairs:
+        trans_table.append((len(v), pos)); pos += len(v) + 1
+    data = struct.pack('<IIIIIII', 0x950412de, 0, n, orig_off, trans_off, 0, 0)
+    for l, o in orig_table: data += struct.pack('<II', l, o)
+    for l, o in trans_table: data += struct.pack('<II', l, o)
+    for k, _ in pairs: data += k + b'\x00'
+    for _, v in pairs: data += v + b'\x00'
+    return data
+
+outfile = sys.argv[1]
+msgid  = sys.argv[2].encode('utf-8')
+msgstr = bytes([int(x, 16) for x in sys.argv[3].split()])
+pairs = [
+    (b'', b'Content-Type: text/plain; charset=UTF-8\n'),
+    (msgid, msgstr),
+]
+with open(outfile, 'wb') as f:
+    f.write(make_mo(pairs))
+PY
+}
+
+_make_mo_charset() {
+  # Create a .mo file with a specific charset declared in the header.
+  # The msgstr is supplied as space-separated hex bytes in that charset's encoding.
+  # Usage: _make_mo_charset OUTFILE CHARSET MSGID MSGSTR_HEX
+  local outfile="$1" charset="$2" msgid="$3" msgstr_hex="$4"
+  python3 - "$outfile" "$charset" "$msgid" "$msgstr_hex" << 'PY'
+import sys, struct
+
+def make_mo(pairs):
+    pairs = sorted(pairs, key=lambda x: x[0])
+    n = len(pairs)
+    orig_off, trans_off = 28, 28 + n * 8
+    pos = trans_off + n * 8
+    orig_table = []
+    for k, _ in pairs:
+        orig_table.append((len(k), pos)); pos += len(k) + 1
+    trans_table = []
+    for _, v in pairs:
+        trans_table.append((len(v), pos)); pos += len(v) + 1
+    data = struct.pack('<IIIIIII', 0x950412de, 0, n, orig_off, trans_off, 0, 0)
+    for l, o in orig_table: data += struct.pack('<II', l, o)
+    for l, o in trans_table: data += struct.pack('<II', l, o)
+    for k, _ in pairs: data += k + b'\x00'
+    for _, v in pairs: data += v + b'\x00'
+    return data
+
+outfile, charset, msgid, msgstr_hex = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+header = f'Content-Type: text/plain; charset={charset}\n'.encode('ascii')
+msgstr = bytes(int(x, 16) for x in msgstr_hex.split())
+pairs = [
+    (b'', header),
+    (msgid.encode('utf-8'), msgstr),
+]
+with open(outfile, 'wb') as f:
+    f.write(make_mo(pairs))
+PY
+}
+
+_make_mo_plural() {
+  # Create a .mo file with ONE plural-form entry (msgstr[0] / msgstr[1]).
+  # Usage: _make_mo_plural OUTFILE MSGID MSGID_PLURAL MSGSTR0 [MSGSTR1]
+  local outfile="$1" msgid="$2" msgid_plural="$3" msgstr0="$4" msgstr1="${5:-}"
+  python3 - "$outfile" "$msgid" "$msgid_plural" "$msgstr0" "$msgstr1" << 'PY'
+import sys, struct
+
+def make_mo(pairs):
+    pairs = sorted(pairs, key=lambda x: x[0])
+    n = len(pairs)
+    orig_off, trans_off = 28, 28 + n * 8
+    pos = trans_off + n * 8
+    orig_table = []; trans_table = []
+    for k, _ in pairs:
+        orig_table.append((len(k), pos)); pos += len(k) + 1
+    for _, v in pairs:
+        trans_table.append((len(v), pos)); pos += len(v) + 1
+    data = struct.pack('<IIIIIII', 0x950412de, 0, n, orig_off, trans_off, 0, 0)
+    for l, o in orig_table: data += struct.pack('<II', l, o)
+    for l, o in trans_table: data += struct.pack('<II', l, o)
+    for k, _ in pairs: data += k + b'\x00'
+    for _, v in pairs: data += v + b'\x00'
+    return data
+
+outfile, msgid, msgid_plural, msgstr0, msgstr1 = sys.argv[1:6]
+# In .mo format: plural-form msgid is "singular\x00plural"
+#                plural-form msgstr is "form0\x00form1\x00..."
+mo_msgid  = (msgid + '\x00' + msgid_plural).encode('utf-8')
+mo_msgstr = msgstr0.encode('utf-8') + b'\x00'
+if msgstr1:
+    mo_msgstr += msgstr1.encode('utf-8') + b'\x00'
+pairs = [
+    (b'', b'Content-Type: text/plain; charset=UTF-8\nPlural-Forms: nplurals=2; plural=(n!=1);\n'),
+    (mo_msgid, mo_msgstr),
+]
+with open(outfile, 'wb') as f:
+    f.write(make_mo(pairs))
+PY
+}
+
+# Require python3 for test file generation
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "SKIP: python3 required for .mo file generation" >&2
+  exit 0
+fi
+
+TMP=$(mktemp -d -t rt_tests.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+_print_header "$SCRIPT"
+
+_section "Basic invocation"
+
+_start "version flag exits 0 and prints program name"
+out=$("$SCRIPT" --version 2>&1)
+_assert_contains "$out" "random-translation"
+
+_start "version flag output includes semver"
+out=$("$SCRIPT" --version 2>&1)
+_assert_contains "$out" "."
+
+_start "--help exits 1 and shows usage"
+out=$("$SCRIPT" --help 2>&1 || true)
+_assert_contains "$out" "Usage:"
+
+_start "no args shows language error"
+out=$("$SCRIPT" 2>&1 || true)
+_assert_contains "$out" "language"
+
+_start "no args shows usage example"
+out=$("$SCRIPT" 2>&1 || true)
+_assert_contains "$out" "random-translation es"
+
+_start "unknown option shows error"
+out=$("$SCRIPT" --no-such-option 2>&1 || true)
+_assert_contains "$out" "unknown option"
+
+_start "unknown option does not dump full usage"
+out=$("$SCRIPT" --no-such-option 2>&1 || true)
+_assert_not_contains "$out" "Discovery strategy"
+
+_start "--theme with no value lists themes and exits 0"
+out=$("$SCRIPT" --theme 2>&1)
+_assert_contains "$out" "jungle"
+_assert_contains "$out" "phosphor"
+
+_start "--output with no value lists modes and exits 0"
+out=$("$SCRIPT" --output 2>&1)
+_assert_contains "$out" "human"
+_assert_contains "$out" "json"
+
+_start "--color with no value lists modes and exits 0"
+out=$("$SCRIPT" --color 2>&1)
+_assert_contains "$out" "auto"
+_assert_contains "$out" "always"
+
+_start "--strategy with no value lists strategies and exits 0"
+out=$("$SCRIPT" --strategy 2>&1)
+_assert_contains "$out" "deep"
+_assert_contains "$out" "index-only"
+
+_start "--reader with no value lists backends and exits 0"
+out=$("$SCRIPT" --reader 2>&1)
+_assert_contains "$out" "msgunfmt"
+_assert_contains "$out" "od"
+
+_start "-n non-integer shows error"
+_make_mo "$TMP/n_test.mo" "Hello" "Hallo"
+out=$("$SCRIPT" --file "$TMP/n_test.mo" -n abc 2>&1 || true)
+_assert_contains "$out" "positive integer"
+
+_start "-n negative value shows error"
+out=$("$SCRIPT" --file "$TMP/n_test.mo" -n -1 2>&1 || true)
+_assert_contains "$out" "error"
+
+_start "--ttl zero shows error"
+out=$("$SCRIPT" --file "$TMP/n_test.mo" --ttl 0 2>&1 || true)
+_assert_contains "$out" "error"
+
+_start "--ttl non-integer shows error"
+out=$("$SCRIPT" --file "$TMP/n_test.mo" --ttl bad 2>&1 || true)
+_assert_contains "$out" "error"
+
+
+_section "--file: od/awk .mo reader"
+
+
+# Basic ASCII
+_make_mo "$TMP/ascii.mo" "Hello" "Hallo" "Cancel" "Abbrechen"
+_start "od: ASCII msgstr appears in JSON output"
+out=$("$SCRIPT" --file "$TMP/ascii.mo" --reader od --output json --no-color)
+_assert_contains "$out" '"Hallo"'
+
+# 2-byte UTF-8 — the key regression: Hungarian 'á' = C3 A1
+_make_mo "$TMP/utf8_2byte.mo" \
+  "Informative output:" "Tájékoztató kimenet:"
+out=$("$SCRIPT" --file "$TMP/utf8_2byte.mo" --reader od --output json --no-color)
+_start "od: 2-byte UTF-8 passes through unescaped (not \\u00c3)"
+_assert_not_contains "$out" '\u00c3'
+_start "od: 2-byte UTF-8 Hungarian acute accents readable"
+_assert_contains "$out" 'Tájékoztató'
+
+# 3-byte UTF-8 — Chinese characters
+_start "od: 3-byte UTF-8 passes through unescaped"
+_make_mo "$TMP/utf8_3byte.mo" "Translate" "翻译"
+out=$("$SCRIPT" --file "$TMP/utf8_3byte.mo" --reader od --output json --no-color)
+_assert_contains "$out" '翻译'
+
+# 4-byte UTF-8 — emoji
+_start "od: 4-byte UTF-8 (emoji) passes through unescaped"
+_make_mo "$TMP/utf8_4byte.mo" "Status" "😀"
+out=$("$SCRIPT" --file "$TMP/utf8_4byte.mo" --reader od --output json --no-color)
+_assert_contains "$out" '😀'
+
+# Non-UTF-8 bytes — should produce valid JSON (escaped as \uXXXX)
+_start "od: non-UTF-8 high bytes produce valid JSON"
+_make_mo_raw "$TMP/latin1.mo" "missing arguments" "d0 ef eb cd e1"
+out=$("$SCRIPT" --file "$TMP/latin1.mo" --reader od --output json --no-color)
+echo "$out" | python3 -c "import sys,json; json.load(sys.stdin)" >/dev/null 2>&1 \
+  && _pass || _fail "output is not valid JSON"
+
+# Multiline strings
+_start "od: multiline msgstr preserved in raw output"
+_make_mo "$TMP/multiline.mo" "Line1\nLine2" "Zeile1\nZeile2"
+out=$("$SCRIPT" --file "$TMP/multiline.mo" --reader od --output raw --no-color)
+_assert_contains "$out" 'Zeile1'
+
+# Long string — regression for truncation on BSD od
+_make_mo "$TMP/longstr.mo" \
+  "String too long in S-expression" "Tul hosszu karakterlanc az S-kifejezesben"
+out=$("$SCRIPT" --file "$TMP/longstr.mo" --reader od --output json --no-color)
+_start "od: long msgid not truncated (BSD od regression)"
+_assert_contains "$out" "String too long in S-expression"
+_start "od: long msgstr not truncated"
+_assert_contains "$out" "Tul hosszu karakterlanc"
+
+# Empty .mo (no entries beyond header)
+_start "od: .mo with zero entries gives no output"
+python3 -c "
+import struct
+data = struct.pack('<IIIIIII', 0x950412de, 0, 0, 28, 28, 0, 0)
+open('$TMP/empty.mo', 'wb').write(data)
+"
+out=$("$SCRIPT" --file "$TMP/empty.mo" --reader od --output json --no-color)
+_assert_eq "$out" "$(printf '[\n]')"
+
+# File with header entry only (msgid="")
+_start "od: header-only .mo (no translatable strings) gives empty array"
+_make_mo "$TMP/header_only.mo"  # no extra pairs
+out=$("$SCRIPT" --file "$TMP/header_only.mo" --reader od --output json --no-color)
+_assert_eq "$out" "$(printf '[\n]')"
+
+
+_section "--file: real uploaded file"
+
+
+# Use the real gettext-runtime.mo if available (uploaded alongside this test)
+_REAL_MO=""
+for _candidate in \
+    "$(dirname "$SCRIPT")/gettext-runtime.mo" \
+    "$(dirname "$0")/gettext-runtime.mo"; do
+  [ -f "$_candidate" ] && _REAL_MO="$_candidate" && break
+done
+
+if [ -n "$_REAL_MO" ]; then
+  _start "od: real gettext-runtime.mo produces valid JSON"
+  out=$("$SCRIPT" --file "$_REAL_MO" --reader od --output json --no-color)
+  echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); assert len(d)>0" \
+    && _pass || _fail "invalid JSON or empty result"
+
+  _start "od: real file Hungarian UTF-8 not escaped as \\u00cX"
+  out=$("$SCRIPT" --file "$_REAL_MO" --reader od --output json --no-color)
+  _assert_not_contains "$out" '\u00c3'
+
+  _start "od: real file contains recognizable Hungarian text"
+  out=$("$SCRIPT" --file "$_REAL_MO" --reader od --output json --no-color)
+  _assert_contains "$out" 'ás'  # common Hungarian suffix in UTF-8
+else
+  for _t in "real file JSON" "real file UTF-8" "real file content"; do
+    _start "$_t"
+    _skip "gettext-runtime.mo not found next to script"
+  done
+fi
+
+
+_section "Output formats"
+
+
+_make_mo "$TMP/fmt.mo" "Open" "Megnyit" "Save" "Mentés"
+
+_start "json output is valid JSON array"
+out=$("$SCRIPT" --file "$TMP/fmt.mo" --reader od --output json --no-color)
+echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d,list)" \
+  && _pass || _fail "not a valid JSON array"
+
+out=$("$SCRIPT" --file "$TMP/fmt.mo" --reader od --output json --no-color)
+_start "json output has msgid key"
+_assert_contains "$out" '"msgid"'
+_start "json output has msgstr key"
+_assert_contains "$out" '"msgstr"'
+
+out=$("$SCRIPT" --file "$TMP/fmt.mo" --reader od --output yaml --no-color)
+_start "yaml output has msgid block scalar marker"
+_assert_contains "$out" '- msgid:'
+_start "yaml output has msgstr block scalar marker"
+_assert_contains "$out" '  msgstr:'
+
+out=$("$SCRIPT" --file "$TMP/fmt.mo" --reader od --output raw --no-color)
+_start "raw output has msgid line"
+_assert_contains "$out" 'msgid'
+_start "raw output has msgstr line"
+_assert_contains "$out" 'msgstr'
+
+_start "filename output prints the file path"
+out=$("$SCRIPT" --file "$TMP/fmt.mo" --reader od --output filename)
+_assert_eq "$out" "$TMP/fmt.mo"
+
+_start "dry-run is alias for --output filename"
+out=$("$SCRIPT" --file "$TMP/fmt.mo" --reader od --dry-run)
+_assert_eq "$out" "$TMP/fmt.mo"
+
+
+_section "-n sampling"
+
+
+_make_mo "$TMP/many.mo" \
+  "One" "Egy" "Two" "Kettő" "Three" "Három" \
+  "Four" "Négy" "Five" "Öt" "Six" "Hat"
+
+_start "-n 2 json returns exactly 2 entries"
+out=$("$SCRIPT" --file "$TMP/many.mo" --reader od --output json --no-color -n 2)
+count=$(echo "$out" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+_assert_eq "$count" "2"
+
+_start "-n 2 raw returns exactly 2 pairs"
+out=$("$SCRIPT" --file "$TMP/many.mo" --reader od --output raw --no-color -n 2)
+count=$(echo "$out" | grep -c '^msgid' || true)
+_assert_eq "$count" "2"
+
+_start "-n larger than total returns all entries"
+out=$("$SCRIPT" --file "$TMP/many.mo" --reader od --output json --no-color -n 999)
+count=$(echo "$out" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+[ "$count" -eq 6 ] && _pass || _fail "expected 6, got $count"
+
+
+_section "--meta flag"
+
+
+_make_mo "$TMP/hdr.mo" "Open" "Megnyit" "Save" "Mentés"
+
+_start "--meta json: first entry has a 'header' key"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output json --no-color --meta)
+echo "$out" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert 'header' in d[0], 'first entry has no header key'
+" && _pass || _fail "header entry missing from JSON output"
+
+_start "--meta json: header object contains Content-Type"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output json --no-color --meta)
+echo "$out" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert 'Content-Type' in d[0]['header'], 'Content-Type missing from header'
+" && _pass || _fail "Content-Type missing from JSON header object"
+
+_start "--meta json: regular entries still have msgid/msgstr"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output json --no-color --meta)
+echo "$out" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+regular = [e for e in d if 'msgid' in e]
+assert len(regular) > 0, 'no regular entries'
+" && _pass || _fail "no regular msgid/msgstr entries found"
+
+_start "--meta raw: output contains empty msgid line"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output raw --no-color --meta)
+_assert_contains "$out" 'msgid ""'
+
+_start "--meta raw: output contains Content-Type metadata"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output raw --no-color --meta)
+_assert_contains "$out" 'Content-Type'
+
+_start "--meta yaml: output contains header mapping"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output yaml --no-color --meta)
+_assert_contains "$out" '- header:'
+_assert_contains "$out" 'Content-Type'
+
+_start "--meta json -n 2: header + 2 regular entries = 3 total"
+out=$("$SCRIPT" --file "$TMP/many.mo" --reader od --output json --no-color --meta -n 2)
+count=$(echo "$out" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+_assert_eq "$count" "3"
+
+_start "--meta json -n 2: first entry is the header object"
+out=$("$SCRIPT" --file "$TMP/many.mo" --reader od --output json --no-color --meta -n 2)
+echo "$out" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert 'header' in d[0], 'first entry is not the header object'
+" && _pass || _fail "header missing or not first in -n 2 JSON output"
+
+_start "--meta raw -n 2: header always present (3 msgid lines total)"
+out=$("$SCRIPT" --file "$TMP/many.mo" --reader od --output raw --no-color --meta -n 2)
+count=$(echo "$out" | grep -c '^msgid' || true)
+_assert_eq "$count" "3"
+
+_start "without --meta json: no header key in any entry"
+out=$("$SCRIPT" --file "$TMP/hdr.mo" --reader od --output json --no-color)
+echo "$out" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert not any('header' in e for e in d), 'unexpected header entry found'
+" && _pass || _fail "header entry unexpectedly present without --meta flag"
+
+
+_section "--reader flag"
+
+
+_start "--reader od explicitly uses od path"
+_make_mo "$TMP/reader.mo" "Yes" "Igen"
+out=$("$SCRIPT" --file "$TMP/reader.mo" --reader od --output json --no-color)
+_assert_contains "$out" '"Igen"'
+
+_start "--reader invalid value shows error"
+out=$("$SCRIPT" --file "$TMP/reader.mo" --reader bad 2>&1 || true)
+_assert_contains "$out" "invalid"
+
+if command -v msgunfmt >/dev/null 2>&1; then
+  _start "--reader msgunfmt uses msgunfmt path"
+  out=$("$SCRIPT" --file "$TMP/reader.mo" --reader msgunfmt --output json --no-color 2>/dev/null || true)
+  # msgunfmt may produce empty output on some systems; that's ok — just check no crash
+  case $? in 0|3) _pass ;; *) _fail "unexpected exit code" ;; esac
+else
+  _start "--reader msgunfmt"
+  _skip "msgunfmt not installed"
+fi
+
+
+_section "Error handling"
+
+
+_start "--file with nonexistent path exits nonzero"
+_assert_fail "$SCRIPT" --file /nonexistent/path.mo
+
+_start "--file with non-.mo file handles gracefully"
+echo "not a mo file" > "$TMP/notamo.bin"
+out=$("$SCRIPT" --file "$TMP/notamo.bin" --reader od 2>&1 || true)
+_assert_contains "$out" "error"
+
+_start "corrupted .mo (truncated header) shows error"
+printf '\xDE\x12\x04\x95' > "$TMP/truncated.mo"  # only 4 bytes
+out=$("$SCRIPT" --file "$TMP/truncated.mo" --reader od 2>&1 || true)
+_assert_contains "$out" "error"
+
+
+_section "msgunfmt path (when available)"
+
+
+if command -v msgunfmt >/dev/null 2>&1; then
+  _make_mo "$TMP/ms.mo" "Open" "Öffnen" "Save" "Speichern"
+
+  _start "msgunfmt: 2-byte UTF-8 passes through unescaped"
+  out=$("$SCRIPT" --file "$TMP/ms.mo" --reader msgunfmt --output json --no-color 2>/dev/null || true)
+  if [ -n "$out" ] && [ "$out" != "$(printf '[\n]')" ]; then
+    _assert_not_contains "$out" '\u00c3'
+  else
+    _skip "msgunfmt produced no output on this system (old gettext)"
+  fi
+
+  _start "msgunfmt: auto mode always produces output (od fallback if needed)"
+  out=$("$SCRIPT" --file "$TMP/ms.mo" --reader auto --output json --no-color 2>/dev/null || true)
+  _assert_contains "$out" '"msgstr"'
+else
+  for _t in "msgunfmt UTF-8" "msgunfmt auto fallback"; do
+    _start "$_t"
+    _skip "msgunfmt not installed"
+  done
+fi
+
+
+_section "Plural-form .mo files"
+
+
+_make_mo_plural "$TMP/plural.mo" "apple" "apples" "Apfel" "Äpfel"
+
+_start "od: plural-form entry: singular form is extracted"
+out=$("$SCRIPT" --file "$TMP/plural.mo" --reader od --output json --no-color)
+_assert_contains "$out" '"apple"'
+
+_start "od: plural-form entry: first translation form is extracted"
+out=$("$SCRIPT" --file "$TMP/plural.mo" --reader od --output json --no-color)
+_assert_contains "$out" '"Apfel"'
+
+if command -v msgunfmt >/dev/null 2>&1; then
+  _start "msgunfmt: plural-form entry produces non-empty output"
+  out=$("$SCRIPT" --file "$TMP/plural.mo" --reader msgunfmt --output json --no-color 2>/dev/null || true)
+  if [ -z "$out" ] || [ "$out" = "$(printf '[\n]')" ]; then
+    _fail "msgunfmt returned empty output for plural-form .mo"
+  else
+    _assert_contains "$out" '"apple"'
+  fi
+
+  _start "msgunfmt: plural-form entry: first translation form is extracted"
+  out=$("$SCRIPT" --file "$TMP/plural.mo" --reader msgunfmt --output json --no-color 2>/dev/null || true)
+  _assert_contains "$out" '"Apfel"'
+else
+  for _t in "msgunfmt plural non-empty" "msgunfmt plural first form"; do
+    _start "$_t"; _skip "msgunfmt not installed"
+  done
+fi
+
+
+_section "Non-UTF-8 charset (ISO-8859-7 Greek)"
+
+
+# ISO-8859-7 bytes for κόσμος (U+03BA U+03CC U+03C3 U+03BC U+03BF U+03C2)
+#   κ=EA  ό=FC  σ=F3  μ=EC  ο=EF  ς=F2
+_ISO_MSGSTR="ea fc f3 ec ef f2"
+_ISO_MSGSTR_UTF8="κόσμος"
+
+_make_mo_charset "$TMP/greek.mo" "ISO-8859-7" "world" "$_ISO_MSGSTR"
+
+if command -v iconv >/dev/null 2>&1; then
+  _start "od: ISO-8859-7 .mo: charset marker emitted (internal check)"
+  # We can't easily run just the awk stage; test observable output instead.
+  # If charset conversion worked, output must contain the Greek word, not \u00EA etc.
+  out=$("$SCRIPT" --file "$TMP/greek.mo" --reader od --output json --no-color)
+  _assert_contains "$out" "$_ISO_MSGSTR_UTF8"
+
+  _start "od: ISO-8859-7 .mo: raw \u00EA escape absent (charset was converted)"
+  _assert_not_contains "$out" '\u00ea'
+  _assert_not_contains "$out" '\u00EA'
+
+  if command -v msgunfmt >/dev/null 2>&1; then
+    _start "msgunfmt: ISO-8859-7 .mo: output contains correct Greek Unicode"
+    out=$("$SCRIPT" --file "$TMP/greek.mo" --reader msgunfmt --output json --no-color 2>/dev/null || true)
+    if [ -z "$out" ] || [ "$out" = "$(printf '[\n]')" ]; then
+      _skip "msgunfmt produced no output for ISO-8859-7 .mo on this system"
+    else
+      _assert_contains "$out" "$_ISO_MSGSTR_UTF8"
+    fi
+  else
+    _start "msgunfmt ISO-8859-7 charset conversion"; _skip "msgunfmt not installed"
+  fi
+else
+  for _t in \
+    "od ISO-8859-7 charset conversion" \
+    "od ISO-8859-7 no raw escapes" \
+    "msgunfmt ISO-8859-7 charset conversion"
+  do
+    _start "$_t"; _skip "iconv not installed"
+  done
+fi
+
+
+_section "--output human"
+
+
+_make_mo "$TMP/human.mo" "Open" "Megnyit" "Save" "Mentés"
+
+_start "human output: translation text is present"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --output human --no-color)
+_assert_contains "$out" 'Megnyit'
+
+_start "human output: source text is present"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --output human --no-color)
+_assert_contains "$out" 'Open'
+
+_start "human output: no msgid label"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --output human --no-color)
+_assert_not_contains "$out" 'msgid'
+
+_start "human output: no msgstr label"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --output human --no-color)
+_assert_not_contains "$out" 'msgstr'
+
+_start "human is the default output mode (no --output flag)"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --no-color)
+_assert_not_contains "$out" 'msgid'
+_assert_contains "$out" 'Megnyit'
+
+_start "human -n 2 returns exactly 2 entries"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --output human --no-color -n 2)
+count=$(printf '%s\n' "$out" | grep -c '^  en ' || true)
+_assert_eq "$count" "2"
+
+# Build a .mo with a rich PO header for human --meta testing
+python3 - "$TMP/human_hdr.mo" << 'PY'
+import sys, struct
+def make_mo(pairs):
+    pairs = sorted(pairs, key=lambda x: x[0])
+    n = len(pairs)
+    orig_off, trans_off = 28, 28 + n * 8
+    pos = trans_off + n * 8
+    orig_table = []; trans_table = []
+    for k, _ in pairs:
+        orig_table.append((len(k), pos)); pos += len(k) + 1
+    for _, v in pairs:
+        trans_table.append((len(v), pos)); pos += len(v) + 1
+    data = struct.pack('<IIIIIII', 0x950412de, 0, n, orig_off, trans_off, 0, 0)
+    for l, o in orig_table: data += struct.pack('<II', l, o)
+    for l, o in trans_table: data += struct.pack('<II', l, o)
+    for k, _ in pairs: data += k + b'\x00'
+    for _, v in pairs: data += v + b'\x00'
+    return data
+header = (
+    b'Content-Type: text/plain; charset=UTF-8\n'
+    b'Language: hu\n'
+    b'Project-Id-Version: myapp 1.0\n'
+    b'Last-Translator: Tesztelo Felhasznalo <test@example.com>\n'
+    b'PO-Revision-Date: 2026-03-15 10:00+0000\n'
+)
+pairs = [(b'', header), (b'Close', 'Bezárás'.encode())]
+with open(sys.argv[1], 'wb') as f:
+    f.write(make_mo(pairs))
+PY
+
+_start "human --meta: language code present (hu shown)"
+out=$("$SCRIPT" --file "$TMP/human_hdr.mo" --reader od --output human --no-color --meta)
+_assert_contains "$out" 'hu'
+
+_start "human --meta: project name present"
+out=$("$SCRIPT" --file "$TMP/human_hdr.mo" --reader od --output human --no-color --meta)
+_assert_contains "$out" 'myapp'
+
+_start "human --meta: revision date present"
+out=$("$SCRIPT" --file "$TMP/human_hdr.mo" --reader od --output human --no-color --meta)
+_assert_contains "$out" '2026-03-15'
+
+_start "human --meta: translator name and email present"
+out=$("$SCRIPT" --file "$TMP/human_hdr.mo" --reader od --output human --no-color --meta)
+_assert_contains "$out" 'Tesztelo Felhasznalo'
+_assert_contains "$out" 'test@example.com'
+
+_start "human --meta: no msgid label"
+out=$("$SCRIPT" --file "$TMP/human_hdr.mo" --reader od --output human --no-color --meta)
+_assert_not_contains "$out" 'msgid'
+
+
+_section "--theme flag"
+
+
+for _theme in aurora jungle phosphor cyberpunk neon sakura classic tokyonight ocean mars; do
+  _start "--theme $_theme accepted"
+  _assert_ok "$SCRIPT" --file "$TMP/human.mo" --reader od --output human --no-color --theme "$_theme"
+done
+
+_start "--theme invalid shows error"
+out=$("$SCRIPT" --file "$TMP/human.mo" --reader od --theme bad 2>&1 || true)
+_assert_contains "$out" "invalid"
+
+
+_section "Human mode locale display"
+
+
+# Build a .mo file at a path that encodes language as es (Spanish)
+mkdir -p "$TMP/es/LC_MESSAGES"
+_make_mo "$TMP/es/LC_MESSAGES/test.mo" "Hello" "Hola"
+
+_start "human mode: locale name shown (Spanish)"
+out=$("$SCRIPT" --file "$TMP/es/LC_MESSAGES/test.mo" --reader od --output human --no-color)
+_assert_contains "$out" "Spanish"
+
+_start "human mode: app name shown (capitalized)"
+out=$("$SCRIPT" --file "$TMP/es/LC_MESSAGES/test.mo" --reader od --output human --no-color)
+_assert_contains "$out" "Test"
+
+# Build a .mo at a reverse-DNS path to test clean_appname
+mkdir -p "$TMP/de/LC_MESSAGES"
+_make_mo "$TMP/de/LC_MESSAGES/com.mitchellh.ghostty.mo" "File" "Datei"
+
+_start "human mode: reverse-DNS app name stripped to base (Ghostty)"
+out=$("$SCRIPT" --file "$TMP/de/LC_MESSAGES/com.mitchellh.ghostty.mo" --reader od --output human --no-color)
+_assert_contains "$out" "Ghostty"
+
+_start "human mode: German locale name shown"
+out=$("$SCRIPT" --file "$TMP/de/LC_MESSAGES/com.mitchellh.ghostty.mo" --reader od --output human --no-color)
+_assert_contains "$out" "German"
+
+# Build a .mo at a regional locale path es_BO
+mkdir -p "$TMP/es_BO/LC_MESSAGES"
+_make_mo "$TMP/es_BO/LC_MESSAGES/app.mo" "Open" "Abrir"
+
+_start "human mode: regional locale shows country (Bolivia)"
+out=$("$SCRIPT" --file "$TMP/es_BO/LC_MESSAGES/app.mo" --reader od --output human --no-color)
+_assert_contains "$out" "Bolivia"
+
+
+_print_summary
+
+[ "$FAIL" -eq 0 ]

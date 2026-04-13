@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-linux:
+    name: Tests (Linux / GNU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: NO_COLOR=1 ./tests/run -v
+
+  test-macos:
+    name: Tests (macOS / BSD)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: NO_COLOR=1 ./tests/run -v
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      - name: Lint random-translation
+        run: shellcheck -x --severity=warning random-translation
+      - name: Lint test runner
+        run: shellcheck -x --severity=warning tests/run
